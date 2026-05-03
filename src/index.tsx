@@ -1886,23 +1886,35 @@ app.get('/api/settings', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const settingsScope = buildUserIdClause('user_id', userId)
+  const hasUpdatedAt = await columnExists(DB, 'settings', 'updated_at')
+  const settingsOrderColumn = hasUpdatedAt ? 'updated_at' : 'created_at'
   
   let result = await DB.prepare(`
     SELECT * FROM settings
     WHERE ${settingsScope.clause}
-    ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, updated_at DESC, id DESC
+    ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, ${settingsOrderColumn} DESC, id DESC
     LIMIT 1
   `).bind(...settingsScope.bindings, userId?.toString()).first()
   
   // 사용자의 설정이 없으면 기본 설정 생성
   if (!result) {
+    const columns = ['currency', 'initial_balance', 'initial_savings', 'category_colors', 'user_id']
+    const values = ["'KRW'", '0', '0', 'NULL', '?']
+    if (hasUpdatedAt) {
+      columns.push('updated_at')
+      values.push('CURRENT_TIMESTAMP')
+    }
+
     await DB.prepare(`
-      INSERT INTO settings (currency, initial_balance, initial_savings, category_colors, user_id)
-      VALUES ('KRW', 0, 0, NULL, ?)
+      INSERT INTO settings (${columns.join(', ')})
+      VALUES (${values.join(', ')})
     `).bind(userId?.toString()).run()
     
     result = await DB.prepare(`
-      SELECT * FROM settings WHERE user_id = ?
+      SELECT * FROM settings
+      WHERE user_id = ?
+      ORDER BY ${settingsOrderColumn} DESC, id DESC
+      LIMIT 1
     `).bind(userId?.toString()).first()
   }
   
@@ -1914,33 +1926,47 @@ app.put('/api/settings', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const { currency, initial_balance, cash_on_hand, category_colors } = await c.req.json()
+  const hasUpdatedAt = await columnExists(DB, 'settings', 'updated_at')
   
   // 설정이 없으면 생성
   const existing = await DB.prepare(`SELECT id FROM settings WHERE user_id = ?`).bind(userId?.toString()).first()
   
   if (!existing) {
-    await DB.prepare(`
-      INSERT INTO settings (currency, initial_balance, cash_on_hand, category_colors, user_id)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(
-      currency, 
-      initial_balance || 0, 
-      cash_on_hand || 0, 
+    const columns = ['currency', 'initial_balance', 'cash_on_hand', 'category_colors', 'user_id']
+    const values = ['?', '?', '?', '?', '?']
+    const bindings = [
+      currency,
+      initial_balance || 0,
+      cash_on_hand || 0,
       category_colors ? JSON.stringify(category_colors) : null,
       userId?.toString()
-    ).run()
+    ]
+    if (hasUpdatedAt) {
+      columns.push('updated_at')
+      values.push('CURRENT_TIMESTAMP')
+    }
+
+    await DB.prepare(`
+      INSERT INTO settings (${columns.join(', ')})
+      VALUES (${values.join(', ')})
+    `).bind(...bindings).run()
   } else {
+    const assignments = ['currency = ?', 'initial_balance = ?', 'cash_on_hand = ?', 'category_colors = ?']
+    const bindings = [
+      currency,
+      initial_balance || 0,
+      cash_on_hand || 0,
+      category_colors ? JSON.stringify(category_colors) : null
+    ]
+    if (hasUpdatedAt) {
+      assignments.push('updated_at = CURRENT_TIMESTAMP')
+    }
+
     await DB.prepare(`
       UPDATE settings 
-      SET currency = ?, initial_balance = ?, cash_on_hand = ?, category_colors = ?
+      SET ${assignments.join(', ')}
       WHERE user_id = ?
-    `).bind(
-      currency, 
-      initial_balance || 0, 
-      cash_on_hand || 0, 
-      category_colors ? JSON.stringify(category_colors) : null,
-      userId?.toString()
-    ).run()
+    `).bind(...bindings, userId?.toString()).run()
   }
   
   return c.json({ success: true })
