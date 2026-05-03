@@ -31,12 +31,12 @@ const schemaCache = new Map<string, boolean>()
 function getCached(key: string): any | null {
   const entry = memoryCache.get(key)
   if (!entry) return null
-  
+
   if (Date.now() > entry.expiry) {
     memoryCache.delete(key)
     return null
   }
-  
+
   return entry.data
 }
 
@@ -45,6 +45,192 @@ function setCache(key: string, data: any, ttlSeconds: number = 60): void {
     data,
     expiry: Date.now() + (ttlSeconds * 1000)
   })
+}
+
+type InvestmentQuote = {
+  symbol: string;
+  requestedSymbol: string;
+  providerSymbol: string;
+  price: number;
+  previousClose: number;
+  change: number;
+  changePercent: number;
+  currency: string;
+  marketState: string;
+  exchangeName: string | null;
+  shortName: string | null;
+  quoteType: string | null;
+  regularMarketTime: number | null;
+  source: 'yahoo';
+  simulated: false;
+}
+
+const CRYPTO_PROVIDER_SYMBOLS: Record<string, string> = {
+  BTC: 'BTC-USD',
+  ETH: 'ETH-USD',
+  BNB: 'BNB-USD',
+  XRP: 'XRP-USD',
+  SOL: 'SOL-USD',
+  ADA: 'ADA-USD',
+  DOGE: 'DOGE-USD',
+  DOT: 'DOT-USD',
+  MATIC: 'MATIC-USD',
+  AVAX: 'AVAX-USD',
+}
+
+function normalizeInvestmentSymbol(rawSymbol: string): { requestedSymbol: string; providerSymbol: string } {
+  const requestedSymbol = String(rawSymbol || '').trim().toUpperCase()
+  const providerSymbol = CRYPTO_PROVIDER_SYMBOLS[requestedSymbol] || requestedSymbol
+
+  return { requestedSymbol, providerSymbol }
+}
+
+function readQuoteNumber(quote: any, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = Number(quote?.[key])
+    if (Number.isFinite(value)) {
+      return value
+    }
+  }
+
+  return null
+}
+
+function getLastFiniteNumber(values: any[] | undefined): number | null {
+  if (!Array.isArray(values)) return null
+
+  for (let i = values.length - 1; i >= 0; i -= 1) {
+    const value = Number(values[i])
+    if (Number.isFinite(value)) {
+      return value
+    }
+  }
+
+  return null
+}
+
+function inferQuoteCurrency(providerSymbol: string): string {
+  if (providerSymbol.endsWith('.KS') || providerSymbol.endsWith('.KQ')) return 'KRW'
+  if (providerSymbol.endsWith('-USD')) return 'USD'
+  return 'USD'
+}
+
+function mapYahooQuoteToInvestmentQuote(
+  requestedSymbol: string,
+  providerSymbol: string,
+  quote: any,
+): InvestmentQuote {
+  const price = readQuoteNumber(quote, [
+    'regularMarketPrice',
+    'postMarketPrice',
+    'preMarketPrice',
+  ])
+
+  if (!price || price <= 0) {
+    throw new Error('No live market price found')
+  }
+
+  const previousClose = readQuoteNumber(quote, ['regularMarketPreviousClose']) || price
+  const change = readQuoteNumber(quote, ['regularMarketChange']) ?? (price - previousClose)
+  const changePercent = readQuoteNumber(quote, ['regularMarketChangePercent'])
+    ?? (previousClose > 0 ? (change / previousClose) * 100 : 0)
+
+  return {
+    symbol: String(quote?.symbol || providerSymbol).toUpperCase(),
+    requestedSymbol,
+    providerSymbol,
+    price,
+    previousClose,
+    change,
+    changePercent,
+    currency: String(quote?.currency || inferQuoteCurrency(providerSymbol)).toUpperCase(),
+    marketState: String(quote?.marketState || 'UNKNOWN'),
+    exchangeName: quote?.fullExchangeName || quote?.exchangeName || null,
+    shortName: quote?.shortName || quote?.longName || null,
+    quoteType: quote?.quoteType || null,
+    regularMarketTime: Number.isFinite(Number(quote?.regularMarketTime))
+      ? Number(quote.regularMarketTime)
+      : null,
+    source: 'yahoo',
+    simulated: false,
+  }
+}
+
+async function fetchYahooInvestmentQuote(rawSymbol: string): Promise<{ data: InvestmentQuote; cached: boolean }> {
+  const { requestedSymbol, providerSymbol } = normalizeInvestmentSymbol(rawSymbol)
+
+  if (!requestedSymbol) {
+    throw new Error('Symbol is required')
+  }
+
+  const cacheKey = `yf:${providerSymbol}`
+  const cached = getCached(cacheKey)
+
+  if (cached) {
+    return {
+      data: {
+        ...cached,
+        requestedSymbol,
+      },
+      cached: true,
+    }
+  }
+
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(providerSymbol)}?range=1d&interval=1d`
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 BudgetLee/1.0',
+      'Accept': 'application/json',
+    },
+  })
+
+  if (!response.ok) {
+    throw new Error(`Yahoo Finance API returned ${response.status}`)
+  }
+
+  const json = await response.json() as any
+  const chartError = json?.chart?.error
+  const chartResult = json?.chart?.result?.[0]
+  const meta = chartResult?.meta
+  const lastClose = getLastFiniteNumber(chartResult?.indicators?.quote?.[0]?.close)
+
+  if (chartError) {
+    throw new Error(chartError.description || chartError.code || 'Yahoo chart API error')
+  }
+
+  if (!meta) {
+    throw new Error('No quote data found')
+  }
+
+  const price = readQuoteNumber(meta, ['regularMarketPrice']) ?? lastClose
+  const previousClose = readQuoteNumber(meta, ['chartPreviousClose', 'previousClose']) ?? price
+  const change = price !== null && previousClose !== null ? price - previousClose : 0
+  const changePercent = previousClose && previousClose > 0 ? (change / previousClose) * 100 : 0
+
+  const quote = {
+    symbol: meta.symbol || providerSymbol,
+    regularMarketPrice: price,
+    regularMarketPreviousClose: previousClose,
+    regularMarketChange: change,
+    regularMarketChangePercent: changePercent,
+    currency: meta.currency,
+    marketState: meta.marketState || 'UNKNOWN',
+    fullExchangeName: meta.fullExchangeName,
+    exchangeName: meta.exchangeName,
+    shortName: meta.shortName,
+    longName: meta.longName,
+    quoteType: meta.instrumentType,
+    regularMarketTime: meta.regularMarketTime,
+  }
+
+  const priceData = mapYahooQuoteToInvestmentQuote(requestedSymbol, providerSymbol, quote)
+
+  setCache(cacheKey, priceData, 60)
+
+  return {
+    data: priceData,
+    cached: false,
+  }
 }
 
 async function tableExists(DB: D1Database, tableName: string): Promise<boolean> {
@@ -581,10 +767,10 @@ async function recalcMonthlySummary(DB: D1Database, userId: number, yearMonth: s
   const endDate = `${yearMonth}-${String(lastDay).padStart(2, '0')}`
   const userBindings = getUserIdBindings(userId)
   const userPlaceholders = userBindings.map(() => '?').join(', ')
-  
+
   // 해당 월의 거래 내역 집계
   const summary = await DB.prepare(`
-    SELECT 
+    SELECT
       SUM(CASE WHEN type='income' THEN amount ELSE 0 END) as income,
       SUM(CASE WHEN type='expense' THEN amount ELSE 0 END) as expense,
       SUM(CASE WHEN type='savings' THEN amount ELSE 0 END) as savings,
@@ -592,12 +778,12 @@ async function recalcMonthlySummary(DB: D1Database, userId: number, yearMonth: s
     FROM transactions
     WHERE user_id IN (${userPlaceholders}) AND date BETWEEN ? AND ?
   `).bind(...userBindings, startDate, endDate).first() as any
-  
+
   const income = summary?.income || 0
   const expense = summary?.expense || 0
   const savings = summary?.savings || 0
   const count = summary?.transaction_count || 0
-  
+
   // UPSERT (있으면 업데이트, 없으면 삽입)
   await DB.prepare(`
     INSERT INTO monthly_summary (year_month, user_id, income, expense, savings, transaction_count, updated_at)
@@ -609,7 +795,7 @@ async function recalcMonthlySummary(DB: D1Database, userId: number, yearMonth: s
       transaction_count = excluded.transaction_count,
       updated_at = CURRENT_TIMESTAMP
   `).bind(yearMonth, String(userId), income, expense, savings, count).run()
-  
+
   console.log(`[Cache] Monthly summary updated: ${yearMonth} for user ${userId}`)
 }
 
@@ -655,8 +841,8 @@ app.use('/api/*', async (c, next) => {
     await next()
   } catch (error: any) {
     console.error('API Error:', error)
-    return c.json({ 
-      success: false, 
+    return c.json({
+      success: false,
       error: error.message || 'Internal server error',
       message: 'Database not configured or connection failed.'
     }, 500)
@@ -691,7 +877,7 @@ async function createToken(userId: number, username: string, secret: string): Pr
 // 인증 미들웨어 (JWT 토큰 + 세션 ID 혼합 지원)
 const authMiddleware = async (c: any, next: any) => {
   const authHeader = c.req.header('Authorization')
-  
+
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     // 헤더가 없으면 기본 사용자 (게스트 모드)
     c.set('userId', 1)
@@ -699,10 +885,10 @@ const authMiddleware = async (c: any, next: any) => {
     await next()
     return
   }
-  
+
   const token = authHeader.substring(7)
   const secret = c.env.JWT_SECRET || 'default-secret-key-change-in-production'
-  
+
   // 1. JWT 토큰인지 확인 (JWT는 'eyJ'로 시작)
   if (token.startsWith('eyJ')) {
     try {
@@ -716,7 +902,7 @@ const authMiddleware = async (c: any, next: any) => {
       console.log('[Auth] JWT verification failed, trying session ID')
     }
   }
-  
+
   // 2. 세션 ID로 처리 (JWT가 아니거나 검증 실패한 경우)
   // 세션 ID를 해싱해서 user_id로 사용 (1~999999 범위)
   let hash = 0
@@ -725,7 +911,7 @@ const authMiddleware = async (c: any, next: any) => {
     hash = hash & hash // Convert to 32bit integer
   }
   const userId = Math.abs(hash % 999999) + 1
-  
+
   c.set('userId', userId)
   c.set('username', `session_${userId}`)
   await next()
@@ -747,7 +933,7 @@ app.get('/sw.js', serveStatic({ root: './' }))
 app.get('/api/auth/google', async (c) => {
   const clientId = c.env.GOOGLE_CLIENT_ID
   const redirectUri = c.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/auth/google/callback'
-  
+
   if (!clientId) {
     return c.html(`
       <html>
@@ -766,7 +952,7 @@ app.get('/api/auth/google', async (c) => {
       </html>
     `)
   }
-  
+
   // Google OAuth URL 생성
   const params = new URLSearchParams({
     client_id: clientId,
@@ -776,9 +962,9 @@ app.get('/api/auth/google', async (c) => {
     access_type: 'offline',
     prompt: 'consent'
   })
-  
+
   const googleAuthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`
-  
+
   return c.redirect(googleAuthUrl)
 })
 
@@ -787,7 +973,7 @@ app.get('/api/auth/google/callback', async (c) => {
   const { DB } = c.env
   const code = c.req.query('code')
   const error = c.req.query('error')
-  
+
   if (error) {
     return c.html(`
       <html>
@@ -799,19 +985,19 @@ app.get('/api/auth/google/callback', async (c) => {
       </html>
     `)
   }
-  
+
   if (!code) {
     return c.json({ success: false, error: 'No authorization code received' }, 400)
   }
-  
+
   const clientId = c.env.GOOGLE_CLIENT_ID
   const clientSecret = c.env.GOOGLE_CLIENT_SECRET
   const redirectUri = c.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/api/auth/google/callback'
-  
+
   if (!clientId || !clientSecret) {
     return c.json({ success: false, error: 'Google OAuth not configured' }, 500)
   }
-  
+
   try {
     // 1. Exchange authorization code for access token
     const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
@@ -827,34 +1013,34 @@ app.get('/api/auth/google/callback', async (c) => {
         grant_type: 'authorization_code',
       }).toString()
     })
-    
+
     if (!tokenResponse.ok) {
       const errorData = await tokenResponse.text()
       console.error('Token exchange failed:', errorData)
       return c.json({ success: false, error: 'Failed to exchange token' }, 500)
     }
-    
+
     const tokenData = await tokenResponse.json() as any
     const accessToken = tokenData.access_token
-    
+
     // 2. Get user info from Google
     const userInfoResponse = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: {
         'Authorization': `Bearer ${accessToken}`
       }
     })
-    
+
     if (!userInfoResponse.ok) {
       return c.json({ success: false, error: 'Failed to get user info' }, 500)
     }
-    
+
     const googleUser = await userInfoResponse.json() as any
-    
+
     // 3. Check if user exists in database
     let user = await DB.prepare(`
       SELECT id, username, name, email FROM users WHERE email = ?
     `).bind(googleUser.email).first() as any
-    
+
     if (!user) {
       // Create new user with Google OAuth
       const result = await DB.prepare(`
@@ -866,7 +1052,7 @@ app.get('/api/auth/google/callback', async (c) => {
         googleUser.name || 'Google User',
         'GOOGLE_OAUTH' // No password for OAuth users
       ).run()
-      
+
       const userId = result.meta.last_row_id as number
       user = {
         id: userId,
@@ -880,15 +1066,15 @@ app.get('/api/auth/google/callback', async (c) => {
         await DB.prepare(`
           UPDATE users SET email = ? WHERE id = ?
         `).bind(googleUser.email, user.id).run()
-        
+
         console.log(`[OAuth] Linked Google account to existing user: ${user.username}`)
       }
     }
-    
+
     // 4. Create JWT token
     const secret = c.env.JWT_SECRET || 'default-secret-key'
     const token = await createToken(user.id, user.username, secret)
-    
+
     const safeToken = JSON.stringify(token)
     const safeEmail = JSON.stringify(user.email || '')
     const safeName = JSON.stringify(user.name || user.username || 'Google User')
@@ -906,7 +1092,7 @@ app.get('/api/auth/google/callback', async (c) => {
             localStorage.setItem('user_name', ${safeName});
             // OAuth 로그인 이후 세션 토큰이 섞이지 않도록 제거
             localStorage.removeItem('sessionId');
-            
+
             // Redirect to home
             window.location.href = '/';
           </script>
@@ -917,22 +1103,22 @@ app.get('/api/auth/google/callback', async (c) => {
         </body>
       </html>
     `)
-    
+
   } catch (error: any) {
     console.error('Google OAuth error:', error)
-    return c.json({ 
-      success: false, 
+    return c.json({
+      success: false,
       error: 'Authentication failed',
-      details: error.message 
+      details: error.message
     }, 500)
   }
 })
 
 // 로그아웃
 app.post('/api/auth/logout', async (c) => {
-  return c.json({ 
-    success: true, 
-    message: '로그아웃되었습니다. (클라이언트에서 토큰을 삭제하세요)' 
+  return c.json({
+    success: true,
+    message: '로그아웃되었습니다. (클라이언트에서 토큰을 삭제하세요)'
   })
 })
 
@@ -940,25 +1126,25 @@ app.post('/api/auth/logout', async (c) => {
 app.get('/api/auth/me', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const username = c.get('username')
-  
+
   if (!userId || userId === 1) {
-    return c.json({ 
-      success: true, 
-      user: { id: 1, username: 'guest', name: 'Guest User', isGuest: true } 
+    return c.json({
+      success: true,
+      user: { id: 1, username: 'guest', name: 'Guest User', isGuest: true }
     })
   }
-  
+
   const { DB } = c.env
   const user = await DB.prepare(`
     SELECT id, username, name, email FROM users WHERE id = ?
   `).bind(userId).first() as any
-  
+
   if (!user) {
     return c.json({ success: false, error: 'User not found' }, 404)
   }
-  
-  return c.json({ 
-    success: true, 
+
+  return c.json({
+    success: true,
     user: {
       id: user.id,
       username: user.username,
@@ -975,39 +1161,39 @@ app.post('/api/auth/link-google', authMiddleware, async (c) => {
   const { DB } = c.env
   const currentUserId = c.get('userId')
   const { googleEmail } = await c.req.json()
-  
+
   if (!currentUserId || currentUserId === 1) {
     return c.json({ success: false, error: '로그인이 필요합니다.' }, 401)
   }
-  
+
   if (!googleEmail || !googleEmail.includes('@')) {
     return c.json({ success: false, error: '유효한 이메일이 필요합니다.' }, 400)
   }
-  
+
   try {
     // 1. 현재 사용자 정보 조회
     const currentUser = await DB.prepare(`
       SELECT id, username, name, email FROM users WHERE id = ?
     `).bind(currentUserId).first() as any
-    
+
     if (!currentUser) {
       return c.json({ success: false, error: '사용자를 찾을 수 없습니다.' }, 404)
     }
-    
+
     // 2. 이미 구글 계정이 연동되어 있는지 확인
     if (currentUser.email && currentUser.email.includes('@')) {
-      return c.json({ 
-        success: false, 
+      return c.json({
+        success: false,
         error: '이미 구글 계정이 연동되어 있습니다.',
         linkedEmail: currentUser.email
       }, 400)
     }
-    
+
     // 3. 해당 이메일로 이미 가입된 구글 계정이 있는지 확인
     const existingGoogleUser = await DB.prepare(`
       SELECT id FROM users WHERE email = ? AND id != ?
     `).bind(googleEmail, currentUserId).first() as any
-    
+
     if (existingGoogleUser) {
       // 구글 계정이 이미 존재하는 경우 - 데이터 마이그레이션 제안
       return c.json({
@@ -1017,14 +1203,14 @@ app.post('/api/auth/link-google', authMiddleware, async (c) => {
         message: '이 구글 계정으로 이미 가입되어 있습니다. 데이터를 마이그레이션하시겠습니까?'
       }, 409)
     }
-    
+
     // 4. 현재 계정에 구글 이메일 연동
     await DB.prepare(`
       UPDATE users SET email = ? WHERE id = ?
     `).bind(googleEmail, currentUserId).run()
-    
+
     console.log(`[Link] Google account linked: ${currentUser.username} -> ${googleEmail}`)
-    
+
     return c.json({
       success: true,
       message: '구글 계정이 성공적으로 연동되었습니다.',
@@ -1035,11 +1221,11 @@ app.post('/api/auth/link-google', authMiddleware, async (c) => {
         email: googleEmail
       }
     })
-    
+
   } catch (error: any) {
     console.error('[Link] Error linking Google account:', error)
-    return c.json({ 
-      success: false, 
+    return c.json({
+      success: false,
       error: '계정 연동 중 오류가 발생했습니다.',
       details: error.message
     }, 500)
@@ -1050,81 +1236,81 @@ app.post('/api/auth/link-google', authMiddleware, async (c) => {
 app.post('/api/auth/migrate-data', authMiddleware, async (c) => {
   const { DB } = c.env
   const { fromUserId, toUserId, password } = await c.req.json()
-  
+
   if (!fromUserId || !toUserId || !password) {
     return c.json({ success: false, error: '필수 정보가 누락되었습니다.' }, 400)
   }
-  
+
   try {
     // 1. 기존 계정 비밀번호 확인
     const fromUser = await DB.prepare(`
       SELECT id, username, password_hash FROM users WHERE id = ?
     `).bind(fromUserId).first() as any
-    
+
     if (!fromUser) {
       return c.json({ success: false, error: '기존 계정을 찾을 수 없습니다.' }, 404)
     }
-    
+
     // 비밀번호 검증
     const passwordHash = await hashPassword(password)
     if (fromUser.password_hash !== passwordHash) {
       return c.json({ success: false, error: '비밀번호가 일치하지 않습니다.' }, 401)
     }
-    
+
     // 2. 대상 계정 확인
     const toUser = await DB.prepare(`
       SELECT id, email FROM users WHERE id = ?
     `).bind(toUserId).first() as any
-    
+
     if (!toUser) {
       return c.json({ success: false, error: '대상 계정을 찾을 수 없습니다.' }, 404)
     }
-    
+
     // 3. 모든 거래 내역 마이그레이션
     await DB.prepare(`
       UPDATE transactions SET user_id = ? WHERE user_id = ?
     `).bind(toUserId, fromUserId).run()
-    
+
     // 4. 저축 계좌 마이그레이션
     await DB.prepare(`
       UPDATE savings_accounts SET user_id = ? WHERE user_id = ?
     `).bind(toUserId, fromUserId).run()
-    
+
     // 5. 고정 지출 마이그레이션
     await DB.prepare(`
       UPDATE fixed_expenses SET user_id = ? WHERE user_id = ?
     `).bind(toUserId, fromUserId).run()
-    
+
     // 6. 카테고리 예산 마이그레이션
     await DB.prepare(`
       UPDATE category_budgets SET user_id = ? WHERE user_id = ?
     `).bind(toUserId, fromUserId).run()
-    
+
     // 7. 투자 내역 마이그레이션
     await DB.prepare(`
       UPDATE investments SET user_id = ? WHERE user_id = ?
     `).bind(toUserId, fromUserId).run()
-    
+
     // 8. 설정 마이그레이션
     await DB.prepare(`
       UPDATE settings SET user_id = ? WHERE user_id = ?
     `).bind(toUserId, fromUserId).run()
-    
+
     // 9. 월별 요약 마이그레이션
     await DB.prepare(`
       UPDATE monthly_summary SET user_id = ? WHERE user_id = ?
     `).bind(toUserId, fromUserId).run()
-    
+
     // 10. 기존 계정 삭제 (선택사항 - 주석 처리하면 보존)
     // await DB.prepare(`DELETE FROM users WHERE id = ?`).bind(fromUserId).run()
-    
+
     // 11. 기존 계정 비활성화 (삭제 대신)
     await DB.prepare(`
       UPDATE users SET password_hash = 'MIGRATED_TO_GOOGLE', name = ? WHERE id = ?
     `).bind(`[MIGRATED] ${fromUser.username}`, fromUserId).run()
-    
+
     console.log(`[Migration] Data migrated: User ${fromUserId} -> ${toUserId}`)
-    
+
     return c.json({
       success: true,
       message: '모든 데이터가 성공적으로 마이그레이션되었습니다.',
@@ -1137,11 +1323,11 @@ app.post('/api/auth/migrate-data', authMiddleware, async (c) => {
         settings: true
       }
     })
-    
+
   } catch (error: any) {
     console.error('[Migration] Error:', error)
-    return c.json({ 
-      success: false, 
+    return c.json({
+      success: false,
       error: '데이터 마이그레이션 중 오류가 발생했습니다.',
       details: error.message
     }, 500)
@@ -1154,47 +1340,47 @@ app.post('/api/auth/migrate-data', authMiddleware, async (c) => {
 app.post('/api/auth/register', async (c) => {
   const { DB } = c.env
   const { username, password, name } = await c.req.json()
-  
+
   // 입력 검증
   if (!username || !password || !name) {
     return c.json({ success: false, error: '모든 필드를 입력해주세요.' }, 400)
   }
-  
+
   if (password.length !== 4) {
     return c.json({ success: false, error: '비밀번호는 4자리여야 합니다.' }, 400)
   }
-  
+
   // 숫자만 허용
   if (!/^\d{4}$/.test(password)) {
     return c.json({ success: false, error: '비밀번호는 숫자 4자리여야 합니다.' }, 400)
   }
-  
+
   // 아이디 중복 확인
   const existing = await DB.prepare(`
     SELECT id FROM users WHERE username = ?
   `).bind(username).first()
-  
+
   if (existing) {
     return c.json({ success: false, error: '이미 사용 중인 아이디입니다.' }, 400)
   }
-  
+
   // SHA-256 비밀번호 해싱
   const passwordHash = await hashPassword(password)
-  
+
   // 사용자 생성
   const result = await DB.prepare(`
     INSERT INTO users (username, password_hash, name)
     VALUES (?, ?, ?)
   `).bind(username, passwordHash, name).run()
-  
+
   const userId = result.meta.last_row_id as number
   const secret = c.env.JWT_SECRET || 'default-secret-key-change-in-production'
-  
+
   // JWT 토큰 발급
   const token = await createToken(userId, username, secret)
-  
-  return c.json({ 
-    success: true, 
+
+  return c.json({
+    success: true,
     token: token,
     user: {
       id: userId,
@@ -1208,38 +1394,38 @@ app.post('/api/auth/register', async (c) => {
 app.post('/api/auth/login', async (c) => {
   const { DB } = c.env
   const { username, password } = await c.req.json()
-  
+
   // 입력 검증
   if (!username || !password) {
     return c.json({ success: false, error: '아이디와 비밀번호를 입력해주세요.' }, 400)
   }
-  
+
   // 사용자 조회
   const user = await DB.prepare(`
     SELECT id, username, password_hash, name FROM users WHERE username = ?
   `).bind(username).first() as any
-  
+
   if (!user) {
     return c.json({ success: false, error: '아이디 또는 비밀번호가 올바르지 않습니다.' }, 401)
   }
-  
+
   // 비밀번호 검증
   const passwordHash = await hashPassword(password)
   if (passwordHash !== user.password_hash) {
     return c.json({ success: false, error: '아이디 또는 비밀번호가 올바르지 않습니다.' }, 401)
   }
-  
+
   // 마지막 로그인 시간 업데이트
   await DB.prepare(`
     UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?
   `).bind(user.id).run()
-  
+
   // JWT 토큰 발급
   const secret = c.env.JWT_SECRET || 'default-secret-key-change-in-production'
   const token = await createToken(user.id, user.username, secret)
-  
-  return c.json({ 
-    success: true, 
+
+  return c.json({
+    success: true,
     token: token,
     user: {
       id: user.id,
@@ -1253,22 +1439,22 @@ app.post('/api/auth/login', async (c) => {
 app.post('/api/auth/refresh', async (c) => {
   const { DB } = c.env
   const { refreshToken } = await c.req.json()
-  
+
   if (!refreshToken) {
     return c.json({ success: false, error: 'Refresh token이 필요합니다.' }, 400)
   }
-  
+
   // Refresh Token 검증
   const session = await verifyRefreshToken(DB, refreshToken)
-  
+
   if (!session) {
     return c.json({ success: false, error: '유효하지 않거나 만료된 refresh token입니다.' }, 401)
   }
-  
+
   // 새로운 Access Token 생성
   const secret = c.env.JWT_SECRET || 'default-secret-key-change-in-production'
   const accessToken = await createAccessToken(session.user_id, session.username, secret)
-  
+
   return c.json({
     success: true,
     access: accessToken    // 통일: access
@@ -1279,11 +1465,11 @@ app.post('/api/auth/refresh', async (c) => {
 app.post('/api/auth/logout', async (c) => {
   const { DB } = c.env
   const { refreshToken } = await c.req.json()
-  
+
   if (refreshToken) {
     await deleteRefreshToken(DB, refreshToken)
   }
-  
+
   return c.json({ success: true, message: '로그아웃되었습니다.' })
 })
 
@@ -1291,17 +1477,17 @@ app.post('/api/auth/logout', async (c) => {
 app.get('/api/auth/me', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
-  
+
   const user = await DB.prepare(`
     SELECT id, username, name, created_at, last_login FROM users WHERE id = ?
   `).bind(userId).first() as any
-  
+
   if (!user) {
     return c.json({ success: false, error: '사용자를 찾을 수 없습니다.' }, 404)
   }
-  
-  return c.json({ 
-    success: true, 
+
+  return c.json({
+    success: true,
     user: {
       id: user.id,
       username: user.username,
@@ -1456,13 +1642,13 @@ app.get('/api/savings-accounts', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const savingsScope = buildUserIdClause('sa.user_id', userId)
   const transactionScope = buildUserIdClause('t.user_id', userId)
-  
+
   if (!DB) {
     return c.json({ success: true, data: [] })
   }
-  
+
   const result = await DB.prepare(`
-    SELECT 
+    SELECT
       sa.*,
       COALESCE(SUM(CASE WHEN t.type = 'savings' THEN t.amount ELSE 0 END), 0) as total_savings
     FROM savings_accounts sa
@@ -1471,7 +1657,7 @@ app.get('/api/savings-accounts', authMiddleware, async (c) => {
     GROUP BY sa.id
     ORDER BY sa.created_at ASC
   `).bind(...transactionScope.bindings, ...savingsScope.bindings).all()
-  
+
   return c.json({ success: true, data: result.results })
 })
 
@@ -1480,15 +1666,15 @@ app.post('/api/savings-accounts', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const { name } = await c.req.json()
-  
+
   if (!name) {
     return c.json({ success: false, error: '통장 이름을 입력해주세요.' }, 400)
   }
-  
+
   const result = await DB.prepare(`
     INSERT INTO savings_accounts (name, balance, user_id) VALUES (?, 0, ?)
   `).bind(name, userId?.toString()).run()
-  
+
   return c.json({ success: true, id: result.meta.last_row_id })
 })
 
@@ -1498,17 +1684,17 @@ app.put('/api/savings-accounts/:id', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const id = c.req.param('id')
   const { name } = await c.req.json()
-  
+
   if (!name || name.trim() === '') {
     return c.json({ success: false, error: '통장 이름을 입력해주세요.' }, 400)
   }
-  
+
   await DB.prepare(`
-    UPDATE savings_accounts 
+    UPDATE savings_accounts
     SET name = ?
     WHERE id = ? AND user_id = ?
   `).bind(name.trim(), id, userId?.toString()).run()
-  
+
   return c.json({ success: true })
 })
 
@@ -1517,9 +1703,9 @@ app.delete('/api/savings-accounts/:id', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const id = c.req.param('id')
-  
+
   await DB.prepare(`DELETE FROM savings_accounts WHERE id = ? AND user_id = ?`).bind(id, userId?.toString()).run()
-  
+
   return c.json({ success: true })
 })
 
@@ -1529,17 +1715,17 @@ app.put('/api/savings-accounts/:id/goal', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const id = c.req.param('id')
   const { savings_goal } = await c.req.json()
-  
+
   if (savings_goal === undefined || savings_goal < 0) {
     return c.json({ success: false, error: '유효한 목표 금액을 입력해주세요.' }, 400)
   }
-  
+
   await DB.prepare(`
-    UPDATE savings_accounts 
+    UPDATE savings_accounts
     SET savings_goal = ?
     WHERE id = ?
   `).bind(savings_goal, id).run()
-  
+
   return c.json({ success: true })
 })
 
@@ -1554,9 +1740,9 @@ app.get('/api/transactions', authMiddleware, async (c) => {
   const type = c.req.query('type')
   const accountLinkingEnabled = await hasPersonalAccountLinking(DB)
   const userScope = buildUserIdClause('t.user_id', userId)
-  
+
   let query = `
-    SELECT 
+    SELECT
       t.*,
       sa.name as savings_account_name,
       ${accountLinkingEnabled ? 'a.name as account_name, a.type as account_type' : 'NULL as account_name, NULL as account_type'}
@@ -1566,7 +1752,7 @@ app.get('/api/transactions', authMiddleware, async (c) => {
     WHERE ${userScope.clause}
   `
   const params: any[] = [...userScope.bindings]
-  
+
   if (startDate) {
     query += ` AND t.date >= ?`
     params.push(startDate)
@@ -1579,9 +1765,9 @@ app.get('/api/transactions', authMiddleware, async (c) => {
     query += ` AND t.type = ?`
     params.push(type)
   }
-  
+
   query += ` ORDER BY t.date DESC, t.created_at DESC`
-  
+
   const result = await DB.prepare(query).bind(...params).all()
   return c.json({ success: true, data: result.results })
 })
@@ -1593,9 +1779,9 @@ app.get('/api/transactions/date/:date', authMiddleware, async (c) => {
   const date = c.req.param('date')
   const accountLinkingEnabled = await hasPersonalAccountLinking(DB)
   const userScope = buildUserIdClause('t.user_id', userId)
-  
+
   const result = await DB.prepare(`
-    SELECT 
+    SELECT
       t.*,
       sa.name as savings_account_name,
       ${accountLinkingEnabled ? 'a.name as account_name, a.type as account_type' : 'NULL as account_name, NULL as account_type'}
@@ -1605,7 +1791,7 @@ app.get('/api/transactions/date/:date', authMiddleware, async (c) => {
     WHERE t.date = ? AND ${userScope.clause}
     ORDER BY t.created_at DESC
   `).bind(date, ...userScope.bindings).all()
-  
+
   return c.json({ success: true, data: result.results })
 })
 
@@ -1615,15 +1801,15 @@ app.post('/api/transactions', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const { type, category, amount, description, date, payment_method, savings_account_id, account_id } = await c.req.json()
   const accountLinkingEnabled = await hasPersonalAccountLinking(DB)
-  
+
   if (!type || !category || !amount || !date) {
     return c.json({ success: false, error: '필수 항목을 입력해주세요.' }, 400)
   }
-  
+
   if (!['income', 'expense', 'savings'].includes(type)) {
     return c.json({ success: false, error: '유효하지 않은 거래 유형입니다.' }, 400)
   }
-  
+
   if (type === 'savings' && !savings_account_id) {
     return c.json({ success: false, error: '저축 통장을 선택해주세요.' }, 400)
   }
@@ -1633,7 +1819,7 @@ app.post('/api/transactions', authMiddleware, async (c) => {
   if (accountLinkingEnabled && normalizedAccountId && !linkedAccount) {
     return c.json({ success: false, error: '연결 계좌를 찾을 수 없습니다.' }, 404)
   }
-  
+
   const batch: D1PreparedStatement[] = [
     accountLinkingEnabled
       ? DB.prepare(`
@@ -1654,11 +1840,11 @@ app.post('/api/transactions', authMiddleware, async (c) => {
 
   const results = await DB.batch(batch)
   const result = results[0]
-  
+
   // 월별 통계 캐시 업데이트
   const yearMonth = date.substring(0, 7) // 'YYYY-MM'
   await recalcMonthlySummary(DB, userId as number, yearMonth)
-  
+
   return c.json({ success: true, id: result.meta.last_row_id })
 })
 
@@ -1758,11 +1944,11 @@ app.put('/api/transactions/:id', authMiddleware, async (c) => {
   const { type, category, amount, description, date, payment_method, savings_account_id, account_id } = await c.req.json()
   const accountLinkingEnabled = await hasPersonalAccountLinking(DB)
   const transactionScope = buildUserIdClause('user_id', userId)
-  
+
   if (!type || !category || !amount || !date) {
     return c.json({ success: false, error: '필수 항목을 입력해주세요.' }, 400)
   }
-  
+
   // 기존 거래 조회 (날짜 변경 감지용)
   const oldTransaction = await DB.prepare(`
     SELECT date, type, amount, ${accountLinkingEnabled ? 'account_id' : 'NULL as account_id'} FROM transactions WHERE id = ? AND ${transactionScope.clause}
@@ -1781,7 +1967,7 @@ app.put('/api/transactions/:id', authMiddleware, async (c) => {
   if (accountLinkingEnabled && normalizedAccountId && !linkedAccount) {
     return c.json({ success: false, error: '연결 계좌를 찾을 수 없습니다.' }, 404)
   }
-  
+
   const batch: D1PreparedStatement[] = []
 
   if (oldTransaction.account_id) {
@@ -1793,12 +1979,12 @@ app.put('/api/transactions/:id', authMiddleware, async (c) => {
   batch.push(
     accountLinkingEnabled
       ? DB.prepare(`
-          UPDATE transactions 
+          UPDATE transactions
           SET type = ?, category = ?, amount = ?, description = ?, date = ?, payment_method = ?, savings_account_id = ?, account_id = ?
           WHERE id = ? AND ${transactionScope.clause}
         `).bind(type, category, amount, description || null, date, payment_method || 'card', savings_account_id || null, normalizedAccountId, id, ...transactionScope.bindings)
       : DB.prepare(`
-          UPDATE transactions 
+          UPDATE transactions
           SET type = ?, category = ?, amount = ?, description = ?, date = ?, payment_method = ?, savings_account_id = ?
           WHERE id = ? AND ${transactionScope.clause}
         `).bind(type, category, amount, description || null, date, payment_method || 'card', savings_account_id || null, id, ...transactionScope.bindings)
@@ -1811,18 +1997,18 @@ app.put('/api/transactions/:id', authMiddleware, async (c) => {
   }
 
   await DB.batch(batch)
-  
+
   // 월별 통계 캐시 업데이트 (기존 월 + 새 월)
   const yearMonth = date.substring(0, 7)
   await recalcMonthlySummary(DB, userId as number, yearMonth)
-  
+
   if (oldTransaction?.date) {
     const oldYearMonth = oldTransaction.date.substring(0, 7)
     if (oldYearMonth !== yearMonth) {
       await recalcMonthlySummary(DB, userId as number, oldYearMonth)
     }
   }
-  
+
   return c.json({ success: true })
 })
 
@@ -1833,7 +2019,7 @@ app.delete('/api/transactions/:id', authMiddleware, async (c) => {
   const id = c.req.param('id')
   const accountLinkingEnabled = await hasPersonalAccountLinking(DB)
   const transactionScope = buildUserIdClause('user_id', userId)
-  
+
   // 삭제 전 날짜 조회 (캐시 업데이트용)
   const transaction = await DB.prepare(`
     SELECT date, type, amount, ${accountLinkingEnabled ? 'account_id' : 'NULL as account_id'} FROM transactions WHERE id = ? AND ${transactionScope.clause}
@@ -1856,13 +2042,13 @@ app.delete('/api/transactions/:id', authMiddleware, async (c) => {
   )
 
   await DB.batch(batch)
-  
+
   // 월별 통계 캐시 업데이트
   if (transaction?.date) {
     const yearMonth = transaction.date.substring(0, 7)
     await recalcMonthlySummary(DB, userId as number, yearMonth)
   }
-  
+
   return c.json({ success: true })
 })
 
@@ -1874,30 +2060,30 @@ app.get('/api/statistics/monthly/:yearMonth', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const yearMonth = c.req.param('yearMonth')
   const transactionScope = buildUserIdClause('user_id', userId)
-  
+
   // 캐시된 월별 요약 확인
   const cachedSummary = await DB.prepare(`
-    SELECT * FROM monthly_summary 
+    SELECT * FROM monthly_summary
     WHERE year_month = ? AND user_id = ?
   `).bind(yearMonth, userId?.toString()).first() as any
-  
+
   // 캐시가 없으면 생성
   if (!cachedSummary) {
     await recalcMonthlySummary(DB, userId as number, yearMonth)
   }
-  
+
   // 기존 방식으로 요약 반환 (API 응답 구조 유지)
   const summary = await DB.prepare(`
-    SELECT 
+    SELECT
       type,
       SUM(amount) as total
     FROM transactions
     WHERE strftime('%Y-%m', date) = ? AND ${transactionScope.clause}
     GROUP BY type
   `).bind(yearMonth, ...transactionScope.bindings).all()
-  
+
   const expenseByCategory = await DB.prepare(`
-    SELECT 
+    SELECT
       category,
       SUM(amount) as total,
       COUNT(*) as count
@@ -1906,9 +2092,9 @@ app.get('/api/statistics/monthly/:yearMonth', authMiddleware, async (c) => {
     GROUP BY category
     ORDER BY total DESC
   `).bind(yearMonth, ...transactionScope.bindings).all()
-  
-  return c.json({ 
-    success: true, 
+
+  return c.json({
+    success: true,
     summary: summary.results,
     expenseByCategory: expenseByCategory.results,
     cached: !!cachedSummary
@@ -1921,22 +2107,22 @@ app.get('/api/statistics/weekly/:startDate', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const startDate = c.req.param('startDate')
   const transactionScope = buildUserIdClause('user_id', userId)
-  
+
   const endDate = new Date(startDate)
   endDate.setDate(endDate.getDate() + 6)
   const endDateStr = endDate.toISOString().split('T')[0]
-  
+
   const summary = await DB.prepare(`
-    SELECT 
+    SELECT
       type,
       SUM(amount) as total
     FROM transactions
     WHERE date >= ? AND date <= ? AND ${transactionScope.clause}
     GROUP BY type
   `).bind(startDate, endDateStr, ...transactionScope.bindings).all()
-  
+
   const expenseByCategory = await DB.prepare(`
-    SELECT 
+    SELECT
       category,
       SUM(amount) as total,
       COUNT(*) as count
@@ -1945,9 +2131,9 @@ app.get('/api/statistics/weekly/:startDate', authMiddleware, async (c) => {
     GROUP BY category
     ORDER BY total DESC
   `).bind(startDate, endDateStr, ...transactionScope.bindings).all()
-  
-  return c.json({ 
-    success: true, 
+
+  return c.json({
+    success: true,
     summary: summary.results,
     expenseByCategory: expenseByCategory.results
   })
@@ -1959,9 +2145,9 @@ app.get('/api/calendar/:yearMonth', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const yearMonth = c.req.param('yearMonth')
   const transactionScope = buildUserIdClause('user_id', userId)
-  
+
   const result = await DB.prepare(`
-    SELECT 
+    SELECT
       date,
       type,
       SUM(amount) as total,
@@ -1971,7 +2157,7 @@ app.get('/api/calendar/:yearMonth', authMiddleware, async (c) => {
     GROUP BY date, type
     ORDER BY date ASC
   `).bind(yearMonth, ...transactionScope.bindings).all()
-  
+
   return c.json({ success: true, data: result.results })
 })
 
@@ -1984,14 +2170,14 @@ app.get('/api/settings', authMiddleware, async (c) => {
   const settingsScope = buildUserIdClause('user_id', userId)
   const hasUpdatedAt = await columnExists(DB, 'settings', 'updated_at')
   const settingsOrderColumn = hasUpdatedAt ? 'updated_at' : 'created_at'
-  
+
   let result = await DB.prepare(`
     SELECT * FROM settings
     WHERE ${settingsScope.clause}
     ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, ${settingsOrderColumn} DESC, id DESC
     LIMIT 1
   `).bind(...settingsScope.bindings, userId?.toString()).first()
-  
+
   // 사용자의 설정이 없으면 기본 설정 생성
   if (!result) {
     const columns = ['currency', 'initial_balance', 'initial_savings', 'category_colors', 'user_id']
@@ -2005,7 +2191,7 @@ app.get('/api/settings', authMiddleware, async (c) => {
       INSERT INTO settings (${columns.join(', ')})
       VALUES (${values.join(', ')})
     `).bind(userId?.toString()).run()
-    
+
     result = await DB.prepare(`
       SELECT * FROM settings
       WHERE user_id = ?
@@ -2013,7 +2199,7 @@ app.get('/api/settings', authMiddleware, async (c) => {
       LIMIT 1
     `).bind(userId?.toString()).first()
   }
-  
+
   return c.json({ success: true, data: result })
 })
 
@@ -2023,10 +2209,10 @@ app.put('/api/settings', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const { currency, initial_balance, cash_on_hand, category_colors } = await c.req.json()
   const hasUpdatedAt = await columnExists(DB, 'settings', 'updated_at')
-  
+
   // 설정이 없으면 생성
   const existing = await DB.prepare(`SELECT id FROM settings WHERE user_id = ?`).bind(userId?.toString()).first()
-  
+
   if (!existing) {
     const columns = ['currency', 'initial_balance', 'cash_on_hand', 'category_colors', 'user_id']
     const values = ['?', '?', '?', '?', '?']
@@ -2059,12 +2245,12 @@ app.put('/api/settings', authMiddleware, async (c) => {
     }
 
     await DB.prepare(`
-      UPDATE settings 
+      UPDATE settings
       SET ${assignments.join(', ')}
       WHERE user_id = ?
     `).bind(...bindings, userId?.toString()).run()
   }
-  
+
   return c.json({ success: true })
 })
 
@@ -2075,13 +2261,13 @@ app.get('/api/fixed-expenses', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const fixedExpenseScope = buildUserIdClause('user_id', userId)
-  
+
   const result = await DB.prepare(`
-    SELECT * FROM fixed_expenses 
+    SELECT * FROM fixed_expenses
     WHERE is_active = 1 AND ${fixedExpenseScope.clause}
     ORDER BY created_at DESC
   `).bind(...fixedExpenseScope.bindings).all()
-  
+
   return c.json({ success: true, data: result.results })
 })
 
@@ -2090,19 +2276,19 @@ app.post('/api/fixed-expenses', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const { name, category, amount, frequency, week_of_month, day_of_week, payment_day, month_of_year } = await c.req.json()
-  
+
   if (!name || !category || !amount || !frequency) {
     return c.json({ success: false, error: '필수 항목을 입력해주세요.' }, 400)
   }
-  
+
   if (!['daily', 'weekly', 'monthly', 'monthly_day', 'yearly'].includes(frequency)) {
     return c.json({ success: false, error: '유효하지 않은 주기입니다.' }, 400)
   }
-  
+
   if (frequency === 'daily') {
     // 추가 입력값 필요 없음
   }
-  
+
   // 'monthly' = 매월 특정 주/요일 (예: 매월 첫째 주 월요일)
   if (frequency === 'monthly') {
     if (!week_of_month) {
@@ -2112,12 +2298,12 @@ app.post('/api/fixed-expenses', authMiddleware, async (c) => {
       return c.json({ success: false, error: '요일을 선택해주세요.' }, 400)
     }
   }
-  
+
   // 'monthly_day' = 매월 특정 일자 (예: 매월 5일)
   if (frequency === 'monthly_day' && !payment_day) {
     return c.json({ success: false, error: '일자를 선택해주세요.' }, 400)
   }
-  
+
   // 'weekly' = 매주 특정 요일 (예: 매주 금요일)
   if (frequency === 'weekly' && day_of_week === undefined) {
     return c.json({ success: false, error: '요일을 선택해주세요.' }, 400)
@@ -2132,9 +2318,9 @@ app.post('/api/fixed-expenses', authMiddleware, async (c) => {
       return c.json({ success: false, error: '일자를 선택해주세요.' }, 400)
     }
   }
-  
+
   const result = await DB.prepare(`
-    INSERT INTO fixed_expenses 
+    INSERT INTO fixed_expenses
     (name, category, amount, frequency, week_of_month, day_of_week, payment_day, month_of_year, is_active, user_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
   `).bind(
@@ -2148,7 +2334,7 @@ app.post('/api/fixed-expenses', authMiddleware, async (c) => {
     month_of_year || null,
     userId?.toString()
   ).run()
-  
+
   return c.json({ success: true, id: result.meta.last_row_id })
 })
 
@@ -2158,19 +2344,19 @@ app.put('/api/fixed-expenses/:id', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const id = c.req.param('id')
   const { name, category, amount, frequency, week_of_month, day_of_week, payment_day, month_of_year } = await c.req.json()
-  
+
   if (!name || !category || !amount || !frequency) {
     return c.json({ success: false, error: '필수 항목을 입력해주세요.' }, 400)
   }
-  
+
   if (!['daily', 'weekly', 'monthly', 'monthly_day', 'yearly'].includes(frequency)) {
     return c.json({ success: false, error: '유효하지 않은 주기입니다.' }, 400)
   }
-  
+
   if (frequency === 'daily') {
     // 추가 입력값 필요 없음
   }
-  
+
   // 'monthly' = 매월 특정 주/요일 (예: 매월 첫째 주 월요일)
   if (frequency === 'monthly') {
     if (!week_of_month) {
@@ -2180,12 +2366,12 @@ app.put('/api/fixed-expenses/:id', authMiddleware, async (c) => {
       return c.json({ success: false, error: '요일을 선택해주세요.' }, 400)
     }
   }
-  
+
   // 'monthly_day' = 매월 특정 일자 (예: 매월 5일)
   if (frequency === 'monthly_day' && !payment_day) {
     return c.json({ success: false, error: '일자를 선택해주세요.' }, 400)
   }
-  
+
   // 'weekly' = 매주 특정 요일 (예: 매주 금요일)
   if (frequency === 'weekly' && day_of_week === undefined) {
     return c.json({ success: false, error: '요일을 선택해주세요.' }, 400)
@@ -2199,10 +2385,10 @@ app.put('/api/fixed-expenses/:id', authMiddleware, async (c) => {
       return c.json({ success: false, error: '일자를 선택해주세요.' }, 400)
     }
   }
-  
+
   await DB.prepare(`
-    UPDATE fixed_expenses 
-    SET name = ?, category = ?, amount = ?, frequency = ?, 
+    UPDATE fixed_expenses
+    SET name = ?, category = ?, amount = ?, frequency = ?,
         week_of_month = ?, day_of_week = ?, payment_day = ?, month_of_year = ?
     WHERE id = ? AND user_id = ?
   `).bind(
@@ -2217,7 +2403,7 @@ app.put('/api/fixed-expenses/:id', authMiddleware, async (c) => {
     id,
     userId?.toString()
   ).run()
-  
+
   return c.json({ success: true })
 })
 
@@ -2226,11 +2412,11 @@ app.delete('/api/fixed-expenses/:id', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const id = c.req.param('id')
-  
+
   await DB.prepare(`
     UPDATE fixed_expenses SET is_active = 0 WHERE id = ? AND user_id = ?
   `).bind(id, userId?.toString()).run()
-  
+
   return c.json({ success: true })
 })
 
@@ -2474,20 +2660,20 @@ function getFixedExpensePeriodGroup(frequency: string): string {
 function getNthDayOfMonth(year: number, month: number, weekOfMonth: number, dayOfWeek: number): Date | null {
   const firstDay = new Date(year, month, 1)
   const firstDayOfWeek = firstDay.getDay()
-  
+
   // 첫 번째 해당 요일 찾기
   let daysToAdd = (dayOfWeek - firstDayOfWeek + 7) % 7
   const firstOccurrence = 1 + daysToAdd
-  
+
   // n번째 해당 요일 계산
   const targetDay = firstOccurrence + (weekOfMonth - 1) * 7
-  
+
   // 해당 월에 존재하는지 확인
   const targetDate = new Date(year, month, targetDay)
   if (targetDate.getMonth() !== month) {
     return null
   }
-  
+
   return targetDate
 }
 
@@ -2507,18 +2693,18 @@ function getAllDaysOfWeekInMonth(year: number, month: number, dayOfWeek: number)
 function getFirstDayOfWeekInMonth(year: number, month: number, dayOfWeek: number): Date | null {
   const firstDay = new Date(year, month, 1)
   const lastDay = new Date(year, month + 1, 0)
-  
+
   // 첫 번째 해당 요일 찾기
   let current = new Date(firstDay)
   while (current.getDay() !== dayOfWeek && current <= lastDay) {
     current.setDate(current.getDate() + 1)
   }
-  
+
   // 해당 월에 존재하는지 확인
   if (current > lastDay) {
     return null
   }
-  
+
   return current
 }
 
@@ -2536,11 +2722,11 @@ app.get('/api/budgets', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const budgetScope = buildUserIdClause('user_id', userId)
-  
+
   const result = await DB.prepare(`
     SELECT * FROM category_budgets WHERE ${budgetScope.clause} ORDER BY category ASC
   `).bind(...budgetScope.bindings).all()
-  
+
   return c.json({ success: true, data: result.results })
 })
 
@@ -2550,19 +2736,19 @@ app.put('/api/budgets/:category', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const category = c.req.param('category')
   const { monthly_budget } = await c.req.json()
-  
+
   if (!monthly_budget || monthly_budget < 0) {
     return c.json({ success: false, error: '유효한 예산 금액을 입력해주세요.' }, 400)
   }
-  
+
   await DB.prepare(`
     INSERT INTO category_budgets (category, monthly_budget, user_id, updated_at)
     VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(category, user_id) DO UPDATE SET 
+    ON CONFLICT(category, user_id) DO UPDATE SET
       monthly_budget = excluded.monthly_budget,
       updated_at = CURRENT_TIMESTAMP
   `).bind(category, monthly_budget, userId?.toString()).run()
-  
+
   return c.json({ success: true })
 })
 
@@ -2571,11 +2757,11 @@ app.delete('/api/budgets/:category', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const category = c.req.param('category')
-  
+
   await DB.prepare(`
     DELETE FROM category_budgets WHERE category = ? AND user_id = ?
   `).bind(category, userId?.toString()).run()
-  
+
   return c.json({ success: true })
 })
 
@@ -2586,20 +2772,20 @@ app.get('/api/budgets/vs-spending/:yearMonth', authMiddleware, async (c) => {
   const yearMonth = c.req.param('yearMonth')
   const budgetScope = buildUserIdClause('cb.user_id', userId)
   const transactionScope = buildUserIdClause('t.user_id', userId)
-  
+
   const result = await DB.prepare(`
-    SELECT 
+    SELECT
       cb.category,
       cb.monthly_budget,
       COALESCE(SUM(t.amount), 0) as actual_spending,
       cb.monthly_budget - COALESCE(SUM(t.amount), 0) as remaining,
-      CASE 
+      CASE
         WHEN cb.monthly_budget = 0 THEN 0
         ELSE ROUND(CAST(COALESCE(SUM(t.amount), 0) AS REAL) / cb.monthly_budget * 100, 1)
       END as percentage
     FROM category_budgets cb
-    LEFT JOIN transactions t ON t.category = cb.category 
-      AND t.type = 'expense' 
+    LEFT JOIN transactions t ON t.category = cb.category
+      AND t.type = 'expense'
       AND ${transactionScope.clause}
       AND strftime('%Y-%m', t.date) = ?
     WHERE ${budgetScope.clause}
@@ -2607,7 +2793,7 @@ app.get('/api/budgets/vs-spending/:yearMonth', authMiddleware, async (c) => {
     GROUP BY cb.category, cb.monthly_budget
     ORDER BY cb.category ASC
   `).bind(...transactionScope.bindings, yearMonth, ...budgetScope.bindings).all()
-  
+
   return c.json({ success: true, data: result.results })
 })
 
@@ -2675,13 +2861,13 @@ app.get('/api/categories', authMiddleware, async (c) => {
 app.get('/api/investments', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
-  
+
   const result = await DB.prepare(`
-    SELECT * FROM investments 
+    SELECT * FROM investments
     WHERE user_id = ?
     ORDER BY created_at DESC
   `).bind(userId?.toString()).all()
-  
+
   return c.json({ success: true, data: result.results })
 })
 
@@ -2690,16 +2876,16 @@ app.post('/api/investments', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const { symbol, name, quantity, purchase_price, purchase_date, notes } = await c.req.json()
-  
+
   if (!symbol || !name || !quantity || !purchase_price || !purchase_date) {
     return c.json({ success: false, error: '필수 항목을 입력해주세요.' }, 400)
   }
-  
+
   const result = await DB.prepare(`
     INSERT INTO investments (symbol, name, quantity, purchase_price, purchase_date, notes, user_id)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).bind(symbol.toUpperCase(), name, quantity, purchase_price, purchase_date, notes || null, userId?.toString()).run()
-  
+
   return c.json({ success: true, id: result.meta.last_row_id })
 })
 
@@ -2709,13 +2895,13 @@ app.put('/api/investments/:id', authMiddleware, async (c) => {
   const userId = c.get('userId')
   const id = c.req.param('id')
   const { symbol, name, quantity, purchase_price, purchase_date, notes } = await c.req.json()
-  
+
   await DB.prepare(`
-    UPDATE investments 
+    UPDATE investments
     SET symbol = ?, name = ?, quantity = ?, purchase_price = ?, purchase_date = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ? AND user_id = ?
   `).bind(symbol.toUpperCase(), name, quantity, purchase_price, purchase_date, notes || null, id, userId?.toString()).run()
-  
+
   return c.json({ success: true })
 })
 
@@ -2724,165 +2910,97 @@ app.delete('/api/investments/:id', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const id = c.req.param('id')
-  
+
   await DB.prepare(`DELETE FROM investments WHERE id = ? AND user_id = ?`).bind(id, userId?.toString()).run()
-  
+
   return c.json({ success: true })
 })
 
-// 7.5 실시간 주가 조회 (외부 API 프록시) - 인증 불필요 (공개 데이터)
+// 7.5 여러 종목 현재가 조회 (외부 API 프록시) - 인증 불필요 (공개 데이터)
+app.get('/api/investments/prices', async (c) => {
+  const symbolsParam = c.req.query('symbols') || ''
+  const symbols = Array.from(new Set(
+    symbolsParam
+      .split(',')
+      .map((symbol) => symbol.trim().toUpperCase())
+      .filter(Boolean)
+  )).slice(0, 50)
+
+  if (symbols.length === 0) {
+    return c.json({ success: false, error: '조회할 종목 심볼을 입력해주세요.' }, 400)
+  }
+
+  const results = await Promise.all(symbols.map(async (symbol) => {
+    try {
+      const quote = await fetchYahooInvestmentQuote(symbol)
+      return { symbol, quote }
+    } catch (error: any) {
+      console.warn(`[Yahoo Finance] API failed for ${symbol}:`, error.message)
+      return {
+        symbol,
+        error: error.message || '주가 정보를 불러올 수 없습니다.',
+      }
+    }
+  }))
+
+  const data: Record<string, InvestmentQuote> = {}
+  const errors: Record<string, string> = {}
+  const cached: Record<string, boolean> = {}
+
+  for (const result of results) {
+    if ('quote' in result) {
+      data[result.symbol] = result.quote.data
+      cached[result.symbol] = result.quote.cached
+    } else {
+      errors[result.symbol] = result.error
+    }
+  }
+
+  return c.json({
+    success: true,
+    data,
+    errors,
+    cached,
+    source: 'yahoo',
+  })
+})
+
+// 7.6 단일 종목 현재가 조회 (외부 API 프록시) - 인증 불필요 (공개 데이터)
 app.get('/api/investments/price/:symbol', async (c) => {
   const symbol = c.req.param('symbol')
-  
-  // 캐시 확인
-  const cacheKey = `yf:${symbol}`
-  const cached = getCached(cacheKey)
-  
-  if (cached) {
-    return c.json({ 
-      success: true, 
-      data: cached, 
-      cached: true 
-    })
-  }
-  
+
   try {
-    // Yahoo Finance API 호출
-    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'BudgetLee/1.0'
-      }
-    })
-    
-    if (!response.ok) {
-      throw new Error(`Yahoo Finance API returned ${response.status}`)
-    }
-    
-    const json = await response.json() as any
-    const quote = json?.quoteResponse?.result?.[0]
-    
-    if (!quote) {
-      throw new Error('No quote data found')
-    }
-    
-    // 데이터 가공
-    const priceData = {
-      symbol: quote.symbol,
-      price: quote.regularMarketPrice || 0,
-      previousClose: quote.regularMarketPreviousClose || 0,
-      change: quote.regularMarketChange || 0,
-      changePercent: quote.regularMarketChangePercent || 0,
-      currency: quote.currency || 'USD',
-      marketState: quote.marketState || 'REGULAR',
-      simulated: false
-    }
-    
-    // 60초 캐시
-    setCache(cacheKey, priceData, 60)
-    
+    const quote = await fetchYahooInvestmentQuote(symbol)
+
     return c.json({
       success: true,
-      data: priceData,
-      cached: false
+      data: quote.data,
+      cached: quote.cached,
+      source: 'yahoo',
     })
-    
   } catch (error: any) {
-    console.warn(`[Yahoo Finance] API failed for ${symbol}, using simulated data:`, error.message)
-    
-    // 실패 시 시뮬레이션 데이터 사용
-    const simulatedPrice = generateSimulatedPrice(symbol)
-    
+    console.warn(`[Yahoo Finance] API failed for ${symbol}:`, error.message)
+
     return c.json({
-      success: true,
-      data: {
-        symbol: symbol,
-        price: simulatedPrice.current,
-        previousClose: simulatedPrice.previous,
-        change: simulatedPrice.current - simulatedPrice.previous,
-        changePercent: ((simulatedPrice.current - simulatedPrice.previous) / simulatedPrice.previous * 100),
-        currency: simulatedPrice.currency,
-        marketState: 'CLOSED',
-        simulated: true
-      },
-      fallback: true,
-      error: error.message
+      success: false,
+      error: error.message || '주가 정보를 불러올 수 없습니다.',
+      source: 'yahoo',
     })
   }
 })
-function generateSimulatedPrice(symbol: string) {
-  // 심볼별 기준 가격 (실제와 유사한 범위)
-  const basePrices: { [key: string]: number } = {
-    // 미국 주식
-    'AAPL': 180,
-    'GOOGL': 140,
-    'MSFT': 370,
-    'TSLA': 180,
-    'AMZN': 170,
-    'META': 480,
-    'NVDA': 870,
-    'AMD': 165,
-    'NFLX': 600,
-    
-    // 한국 주식
-    '005930.KS': 70000, // 삼성전자
-    '000660.KS': 120000, // SK하이닉스
-    
-    // 암호화폐 (USD 기준)
-    'BTC': 65000,  // 비트코인
-    'ETH': 3200,   // 이더리움
-    'BNB': 580,    // 바이낸스코인
-    'XRP': 0.60,   // 리플
-    'SOL': 140,    // 솔라나
-    'ADA': 0.45,   // 카르다노
-    'DOGE': 0.08,  // 도지코인
-    'DOT': 6.5,    // 폴카닷
-    'MATIC': 0.85, // 폴리곤
-    'AVAX': 35,    // 아발란체
-  }
-  
-  const basePrice = basePrices[symbol] || 100
-  
-  // 한국 주식 여부 확인
-  const isKoreanStock = symbol.endsWith('.KS') || symbol.endsWith('.KQ')
-  
-  // 암호화폐 여부 확인 (주요 코인 심볼)
-  const cryptoSymbols = ['BTC', 'ETH', 'BNB', 'XRP', 'SOL', 'ADA', 'DOGE', 'DOT', 'MATIC', 'AVAX']
-  const isCrypto = cryptoSymbols.includes(symbol)
-  
-  // 통화 결정
-  let currency = 'USD'
-  if (isKoreanStock) {
-    currency = 'KRW'
-  } else if (isCrypto) {
-    currency = 'USD' // 암호화폐는 USD 기준
-  }
-  
-  // 랜덤 변동 (암호화폐는 변동성이 더 큼)
-  const volatility = isCrypto ? 0.15 : 0.1 // 암호화폐 -7.5% ~ +7.5%, 주식 -5% ~ +5%
-  const randomVariation = (Math.random() - 0.5) * volatility
-  const currentPrice = basePrice * (1 + randomVariation)
-  const previousPrice = basePrice * (1 + (randomVariation * 0.5))
-  
-  return {
-    current: Math.round(currentPrice * 100) / 100,
-    previous: Math.round(previousPrice * 100) / 100,
-    currency: currency
-  }
-}
 
-// 7.6 투자 거래 내역 조회
+// 7.7 투자 거래 내역 조회
 app.get('/api/investments/:id/transactions', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
   const id = c.req.param('id')
-  
+
   const result = await DB.prepare(`
-    SELECT * FROM investment_transactions 
+    SELECT * FROM investment_transactions
     WHERE investment_id = ? AND user_id = ?
     ORDER BY transaction_date DESC
   `).bind(id, userId?.toString()).all()
-  
+
   return c.json({ success: true, data: result.results })
 })
 
@@ -2899,25 +3017,25 @@ app.get('/', (c) => {
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Budget Lee">
-    
+
     <!-- 캐시 방지 메타태그 -->
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
-    
+
     <title>Budget Lee</title>
     <link rel="manifest" href="/manifest.json">
-    
+
     <!-- PWA 아이콘 -->
     <link rel="icon" type="image/x-icon" href="/favicon.ico">
     <link rel="icon" type="image/png" sizes="192x192" href="/icon-192x192.png">
     <link rel="icon" type="image/png" sizes="512x512" href="/icon-512x512.png">
     <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-    
+
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
     <link href="/static/style.css?v=${Date.now()}" rel="stylesheet">
-    
+
     <style>
         /* 배경 - 바운스 시에도 배경 확장 */
         html {
@@ -2955,7 +3073,7 @@ app.get('/', (c) => {
                     <i class="fas fa-wallet mr-3 text-blue-600"></i>
                     Budget Lee
                 </h1>
-                
+
                 <!-- 사용자 정보 & 로그인 버튼 -->
                 <div id="user-section" class="flex items-center gap-4">
                     <!-- 로그인 안 된 상태 -->
@@ -2970,7 +3088,7 @@ app.get('/', (c) => {
                             <span class="text-sm font-medium text-gray-700">Sign in with Google</span>
                         </a>
                     </div>
-                    
+
                     <!-- 로그인 된 상태 -->
                     <div id="user-info-section" class="hidden items-center gap-3">
                         <div class="flex items-center gap-2 px-3 py-2 bg-blue-50 rounded-lg">
@@ -2986,7 +3104,7 @@ app.get('/', (c) => {
                     </div>
                 </div>
             </div>
-            
+
             <!-- 탭 네비게이션 -->
             <div class="border-b mb-6">
                 <nav class="flex flex-wrap -mb-px">
@@ -3022,7 +3140,7 @@ app.get('/', (c) => {
                     </button>
                 </nav>
             </div>
-            
+
             <!-- 콘텐츠 영역 -->
             <div id="content-area" class="min-h-screen">
                 <div class="text-center text-gray-500 py-8">
@@ -3047,11 +3165,11 @@ app.get('/', (c) => {
           navigator.serviceWorker.register('/sw.js')
             .then((registration) => {
               console.log('[PWA] Service Worker registered successfully');
-              
+
               // 업데이트 확인
               registration.addEventListener('updatefound', () => {
                 const newWorker = registration.installing;
-                
+
                 newWorker.addEventListener('statechange', () => {
                   if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
                     // 새 버전 감지 - 사용자에게 알림
@@ -3066,7 +3184,7 @@ app.get('/', (c) => {
             .catch((err) => {
               console.warn('[PWA] Service Worker registration failed:', err);
             });
-          
+
           // 컨트롤러 변경 시 자동 새로고침
           navigator.serviceWorker.addEventListener('controllerchange', () => {
             window.location.reload();
@@ -3818,7 +3936,7 @@ app.post('/api/receipts', authMiddleware, async (c) => {
     const receiptResult = await DB.prepare(`
       INSERT INTO receipts
         (store_name, purchase_date, amount, category,
-         payment_method, notes, 
+         payment_method, notes,
          image_data, image_type,
          merchant, is_tax_deductible,
          user_id, created_at)
@@ -3855,10 +3973,10 @@ app.post('/api/receipts', authMiddleware, async (c) => {
 
     const transactionId = tx.meta.last_row_id;
 
-    return c.json({ 
-      success: true, 
-      receipt_id: receiptId, 
-      transaction_id: transactionId 
+    return c.json({
+      success: true,
+      receipt_id: receiptId,
+      transaction_id: transactionId
     });
   } catch (error: any) {
     console.error('[Receipts] Save error:', error);
@@ -3871,27 +3989,27 @@ app.post('/api/receipts/ocr', authMiddleware, async (c) => {
   try {
     const body = await c.req.json();
     const { image_data } = body;
-    
+
     if (!image_data) {
       return c.json({ success: false, error: 'No image data' }, 400);
     }
-    
+
     const { GOOGLE_VISION_API_KEY } = c.env;
-    
+
     console.log('[OCR] API Key status:', GOOGLE_VISION_API_KEY ? 'Present' : 'Missing');
-    
+
     // Google Vision API 키가 없으면 폴백 (데모 모드)
     if (!GOOGLE_VISION_API_KEY || GOOGLE_VISION_API_KEY === 'your-google-vision-api-key-here') {
       console.log('[OCR] Google Vision API key not configured, using demo mode');
-      
+
       // 데모 데이터 반환
       const merchants = ['스타벅스', 'GS25', '이마트', '올리브영', 'CU편의점', '맥도날드', '버거킹'];
       const amounts = [5000, 12000, 25000, 38000, 15000, 8500, 42000];
-      
+
       const today = new Date();
       const daysAgo = Math.floor(Math.random() * 7);
       today.setDate(today.getDate() - daysAgo);
-      
+
       return c.json({
         success: true,
         data: {
@@ -3902,13 +4020,13 @@ app.post('/api/receipts/ocr', authMiddleware, async (c) => {
         message: '데모 모드: 랜덤 데이터가 생성되었습니다. Google Vision API 키를 설정하면 실제 OCR이 작동합니다.'
       });
     }
-    
+
     // Base64에서 이미지 데이터만 추출 (data:image/png;base64, 제거)
     const base64Image = image_data.replace(/^data:image\/\w+;base64,/, '');
-    
+
     // Google Vision API 호출
     const visionApiUrl = `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`;
-    
+
     const visionResponse = await fetch(visionApiUrl, {
       method: 'POST',
       headers: {
@@ -3926,16 +4044,16 @@ app.post('/api/receipts/ocr', authMiddleware, async (c) => {
         }]
       })
     });
-    
+
     if (!visionResponse.ok) {
       const errorText = await visionResponse.text();
       console.error('[OCR] Vision API error:', visionResponse.status, errorText);
       throw new Error(`Vision API error: ${visionResponse.status} - ${errorText}`);
     }
-    
+
     const visionData = await visionResponse.json() as any;
     console.log('[OCR] Vision API response:', JSON.stringify(visionData).substring(0, 200));
-    
+
     // 텍스트 추출
     const textAnnotations = visionData.responses[0]?.textAnnotations;
     if (!textAnnotations || textAnnotations.length === 0) {
@@ -3944,14 +4062,14 @@ app.post('/api/receipts/ocr', authMiddleware, async (c) => {
         error: '영수증에서 텍스트를 찾을 수 없습니다.'
       });
     }
-    
+
     // 전체 텍스트 (첫 번째 항목이 전체 텍스트)
     const fullText = textAnnotations[0].description;
     console.log('[OCR] Extracted text:', fullText);
-    
+
     // 텍스트에서 정보 추출
     const extracted = extractReceiptInfo(fullText);
-    
+
     return c.json({
       success: true,
       data: extracted,
@@ -3959,8 +4077,8 @@ app.post('/api/receipts/ocr', authMiddleware, async (c) => {
     });
   } catch (error: any) {
     console.error('[OCR] Error:', error);
-    return c.json({ 
-      success: false, 
+    return c.json({
+      success: false,
       error: 'OCR 처리 실패: ' + (error.message || '알 수 없는 오류')
     }, 500);
   }
@@ -3977,62 +4095,62 @@ function extractReceiptInfo(text: string) {
     date: null,
     amount: null
   };
-  
+
   // 줄바꿈으로 분리
   const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
-  
+
   // 1. 상점명 추출 (보통 첫 1-3줄에 있음)
   if (lines.length > 0) {
     // 회사명, 점포명 등의 키워드가 있는 줄 찾기
     const merchantKeywords = ['(주)', '주식회사', '상회', '마트', '편의점', 'STORE', 'SHOP', 'CAFE'];
     for (let i = 0; i < Math.min(5, lines.length); i++) {
       const line = lines[i];
-      if (merchantKeywords.some(keyword => line.includes(keyword)) || 
+      if (merchantKeywords.some(keyword => line.includes(keyword)) ||
           (line.length > 2 && line.length < 30 && i < 3)) {
         extracted.merchant = line;
         break;
       }
     }
-    
+
     // 상점명을 못 찾았으면 첫 줄 사용
     if (!extracted.merchant) {
       extracted.merchant = lines[0];
     }
   }
-  
+
   // 2. 날짜 추출 (YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD 형식)
   const datePatterns = [
     /(\d{4})[-./](\d{1,2})[-./](\d{1,2})/,  // 2024-11-03, 2024/11/03, 2024.11.03
     /(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일/,  // 2024년 11월 03일
     /(\d{2})[-./](\d{1,2})[-./](\d{1,2})/    // 24-11-03
   ];
-  
+
   for (const pattern of datePatterns) {
     const match = text.match(pattern);
     if (match) {
       let year = match[1];
       let month = match[2].padStart(2, '0');
       let day = match[3].padStart(2, '0');
-      
+
       // 2자리 연도를 4자리로 변환
       if (year.length === 2) {
         year = '20' + year;
       }
-      
+
       extracted.date = `${year}-${month}-${day}`;
       break;
     }
   }
-  
+
   // 날짜를 못 찾았으면 오늘 날짜
   if (!extracted.date) {
     extracted.date = new Date().toISOString().split('T')[0];
   }
-  
+
   // 3. 금액 추출 (합계, 총액, 결제금액 등의 키워드 근처)
   const amountKeywords = ['합계', '총액', '결제금액', '합 계', 'TOTAL', 'Total', '카드승인금액', '받을금액'];
   const numberPattern = /[\d,]+/g;
-  
+
   // 금액 키워드가 있는 줄 찾기
   for (const keyword of amountKeywords) {
     for (const line of lines) {
@@ -4053,7 +4171,7 @@ function extractReceiptInfo(text: string) {
     }
     if (extracted.amount) break;
   }
-  
+
   // 금액을 못 찾았으면 가장 큰 숫자 사용
   if (!extracted.amount) {
     const allNumbers = text.match(numberPattern);
@@ -4061,13 +4179,13 @@ function extractReceiptInfo(text: string) {
       const amounts = allNumbers
         .map(n => parseInt(n.replace(/,/g, '')))
         .filter(a => !isNaN(a) && a > 100 && a < 10000000); // 100원 ~ 1000만원
-      
+
       if (amounts.length > 0) {
         extracted.amount = Math.max(...amounts);
       }
     }
   }
-  
+
   return extracted;
 }
 
@@ -4079,7 +4197,7 @@ app.get('/api/receipts', authMiddleware, async (c) => {
   const endDate = c.req.query('end_date');
 
   let query = `
-    SELECT 
+    SELECT
       r.id, r.merchant, r.purchase_date, r.amount, r.category,
       r.payment_method, r.notes, r.is_tax_deductible,
       r.image_data, r.image_type,
@@ -4166,26 +4284,26 @@ app.get('/api/debts', authMiddleware, async (c) => {
   try {
     const { DB } = c.env as { DB: D1Database };
     const userId = c.get('userId');
-    
+
     if (!userId) {
       return c.json({ success: false, error: 'Unauthorized' }, 401);
     }
 
     const debts = await DB.prepare(`
-      SELECT * FROM debts 
+      SELECT * FROM debts
       WHERE user_id = ?
-      ORDER BY 
-        CASE status 
-          WHEN 'overdue' THEN 1 
-          WHEN 'active' THEN 2 
-          WHEN 'paid' THEN 3 
+      ORDER BY
+        CASE status
+          WHEN 'overdue' THEN 1
+          WHEN 'active' THEN 2
+          WHEN 'paid' THEN 3
         END,
         due_date ASC
     `).bind(String(userId)).all();
 
-    return c.json({ 
-      success: true, 
-      debts: debts.results || [] 
+    return c.json({
+      success: true,
+      debts: debts.results || []
     });
   } catch (error: any) {
     console.error('[Debts] Get all error:', error);
@@ -4198,7 +4316,7 @@ app.post('/api/debts', authMiddleware, async (c) => {
   try {
     const { DB } = c.env as { DB: D1Database };
     const userId = c.get('userId');
-    
+
     if (!userId) {
       return c.json({ success: false, error: 'Unauthorized' }, 401);
     }
@@ -4207,9 +4325,9 @@ app.post('/api/debts', authMiddleware, async (c) => {
     const { creditor, amount, interest_rate, start_date, due_date, category, notes } = body;
 
     if (!creditor || !amount || !start_date) {
-      return c.json({ 
-        success: false, 
-        error: '채권자, 금액, 시작일은 필수입니다' 
+      return c.json({
+        success: false,
+        error: '채권자, 금액, 시작일은 필수입니다'
       }, 400);
     }
 
@@ -4230,9 +4348,9 @@ app.post('/api/debts', authMiddleware, async (c) => {
       String(userId)
     ).run();
 
-    return c.json({ 
-      success: true, 
-      id: result.meta.last_row_id 
+    return c.json({
+      success: true,
+      id: result.meta.last_row_id
     });
   } catch (error: any) {
     console.error('[Debts] Create error:', error);
@@ -4245,7 +4363,7 @@ app.put('/api/debts/:id', authMiddleware, async (c) => {
   try {
     const { DB } = c.env as { DB: D1Database };
     const userId = c.get('userId');
-    
+
     if (!userId) {
       return c.json({ success: false, error: 'Unauthorized' }, 401);
     }
@@ -4264,8 +4382,8 @@ app.put('/api/debts/:id', authMiddleware, async (c) => {
     }
 
     await DB.prepare(`
-      UPDATE debts 
-      SET creditor = ?, amount = ?, remaining_amount = ?, 
+      UPDATE debts
+      SET creditor = ?, amount = ?, remaining_amount = ?,
           interest_rate = ?, start_date = ?, due_date = ?,
           status = ?, category = ?, notes = ?,
           updated_at = CURRENT_TIMESTAMP
@@ -4296,7 +4414,7 @@ app.delete('/api/debts/:id', authMiddleware, async (c) => {
   try {
     const { DB } = c.env as { DB: D1Database };
     const userId = c.get('userId');
-    
+
     if (!userId) {
       return c.json({ success: false, error: 'Unauthorized' }, 401);
     }
@@ -4329,7 +4447,7 @@ app.get('/api/debts/:id/payments', authMiddleware, async (c) => {
   try {
     const { DB } = c.env as { DB: D1Database };
     const userId = c.get('userId');
-    
+
     if (!userId) {
       return c.json({ success: false, error: 'Unauthorized' }, 401);
     }
@@ -4346,14 +4464,14 @@ app.get('/api/debts/:id/payments', authMiddleware, async (c) => {
     }
 
     const payments = await DB.prepare(`
-      SELECT * FROM debt_payments 
+      SELECT * FROM debt_payments
       WHERE debt_id = ? AND user_id = ?
       ORDER BY payment_date DESC
     `).bind(debtId, String(userId)).all();
 
-    return c.json({ 
-      success: true, 
-      payments: payments.results || [] 
+    return c.json({
+      success: true,
+      payments: payments.results || []
     });
   } catch (error: any) {
     console.error('[Debts] Get payments error:', error);
@@ -4366,7 +4484,7 @@ app.post('/api/debts/:id/payments', authMiddleware, async (c) => {
   try {
     const { DB } = c.env as { DB: D1Database };
     const userId = c.get('userId');
-    
+
     if (!userId) {
       return c.json({ success: false, error: 'Unauthorized' }, 401);
     }
@@ -4376,9 +4494,9 @@ app.post('/api/debts/:id/payments', authMiddleware, async (c) => {
     const { amount, payment_date, notes } = body;
 
     if (!amount || !payment_date) {
-      return c.json({ 
-        success: false, 
-        error: '금액과 날짜는 필수입니다' 
+      return c.json({
+        success: false,
+        error: '금액과 날짜는 필수입니다'
       }, 400);
     }
 
@@ -4408,7 +4526,7 @@ app.post('/api/debts/:id/payments', authMiddleware, async (c) => {
     const newStatus = newRemaining <= 0 ? 'paid' : 'active';
 
     await DB.prepare(`
-      UPDATE debts 
+      UPDATE debts
       SET remaining_amount = ?, status = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ? AND user_id = ?
     `).bind(
@@ -4430,7 +4548,7 @@ app.delete('/api/debts/:debtId/payments/:paymentId', authMiddleware, async (c) =
   try {
     const { DB } = c.env as { DB: D1Database };
     const userId = c.get('userId');
-    
+
     if (!userId) {
       return c.json({ success: false, error: 'Unauthorized' }, 401);
     }
@@ -4462,7 +4580,7 @@ app.delete('/api/debts/:debtId/payments/:paymentId', authMiddleware, async (c) =
       const newStatus = newRemaining < Number(debt.amount) ? 'active' : 'active';
 
       await DB.prepare(`
-        UPDATE debts 
+        UPDATE debts
         SET remaining_amount = ?, status = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND user_id = ?
       `).bind(
@@ -4486,7 +4604,7 @@ app.delete('/api/debts/:debtId/payments/:paymentId', authMiddleware, async (c) =
 app.post('/api/reset-all-data', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')!
-  
+
   try {
     // 모든 사용자 데이터 삭제
     await DB.batch([
@@ -4505,10 +4623,10 @@ app.post('/api/reset-all-data', authMiddleware, async (c) => {
       DB.prepare('DELETE FROM accounts WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM transfers WHERE user_id = ?').bind(userId)
     ])
-    
-    return c.json({ 
-      success: true, 
-      message: '모든 데이터가 초기화되었습니다. 페이지를 새로고침 해주세요.' 
+
+    return c.json({
+      success: true,
+      message: '모든 데이터가 초기화되었습니다. 페이지를 새로고침 해주세요.'
     })
   } catch (error: any) {
     console.error('[Reset] Data reset error:', error)
@@ -4520,10 +4638,10 @@ app.post('/api/reset-all-data', authMiddleware, async (c) => {
 app.delete('/api/account/delete', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')!
-  
+
   try {
     console.log(`[Account] Starting account deletion for user_id: ${userId}`)
-    
+
     // 안전한 삭제 헬퍼 함수 (테이블이 없어도 에러 안남)
     const safeDelete = async (tableName: string) => {
       try {
@@ -4539,7 +4657,7 @@ app.delete('/api/account/delete', authMiddleware, async (c) => {
         throw err
       }
     }
-    
+
     // 순차적으로 삭제 (외래 키 제약 조건 고려)
     // 1. 자식 테이블들 먼저 삭제
     await safeDelete('debt_payments')
@@ -4552,31 +4670,31 @@ app.delete('/api/account/delete', authMiddleware, async (c) => {
     await safeDelete('receipts')
     await safeDelete('transactions')
     await safeDelete('accounts')
-    
+
     // 2. 독립적인 테이블들
     await safeDelete('category_budgets')
     await safeDelete('savings_accounts')
     await safeDelete('monthly_summary')
     await safeDelete('settings')
-    
+
     // 3. 세션 삭제
     await safeDelete('sessions')
-    
+
     // 4. 마지막으로 사용자 계정 삭제
     const deleteResult = await DB.prepare('DELETE FROM users WHERE id = ?').bind(userId).run()
-    
+
     console.log(`[Account] Account deleted successfully. User rows affected: ${deleteResult.meta.changes}`)
-    
-    return c.json({ 
-      success: true, 
-      message: '계정이 완전히 삭제되었습니다.' 
+
+    return c.json({
+      success: true,
+      message: '계정이 완전히 삭제되었습니다.'
     })
   } catch (error: any) {
     console.error('[Account] Delete account error:', error)
     console.error('[Account] Error details:', error.message, error.stack)
-    return c.json({ 
-      success: false, 
-      error: `계정 삭제 실패: ${error.message || '알 수 없는 오류'}` 
+    return c.json({
+      success: false,
+      error: `계정 삭제 실패: ${error.message || '알 수 없는 오류'}`
     }, 500)
   }
 })
