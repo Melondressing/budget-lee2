@@ -168,6 +168,25 @@ function normalizeEmployeeeeEntry(entry: any): any | null {
   }
 }
 
+function normalizeDateString(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return null
+  return trimmed.substring(0, 10)
+}
+
+function normalizeMoney(value: unknown): number {
+  const numberValue = Number(value)
+  if (!Number.isFinite(numberValue)) return 0
+  return Math.round(numberValue * 100) / 100
+}
+
+function normalizeInteger(value: unknown): number {
+  const numberValue = Number(value)
+  if (!Number.isFinite(numberValue)) return 0
+  return Math.max(0, Math.round(numberValue))
+}
+
 async function readEmployeeeeBootstrap(DB: D1Database, userId: number): Promise<{ pay_rule: any | null; work_entries: any[] }> {
   const [ruleRow, entriesResult] = await Promise.all([
     DB.prepare(`
@@ -220,6 +239,127 @@ async function replaceEmployeeeeWorkEntries(DB: D1Database, userId: number, entr
   }
 
   await DB.batch(statements)
+}
+
+async function exportEmployeeeePayRunToBudget(DB: D1Database, userId: number, payload: any): Promise<any> {
+  const periodStart = normalizeDateString(payload?.period_start || payload?.periodStart)
+  const periodEnd = normalizeDateString(payload?.period_end || payload?.periodEnd)
+  const payday = normalizeDateString(payload?.payday || payload?.postedDate)
+  const summaryMode = String(payload?.summary_mode || payload?.summaryMode || 'cycle')
+  const currency = String(payload?.currency || '')
+  const gross = normalizeMoney(payload?.gross)
+  const deductions = normalizeMoney(payload?.deductions)
+  const net = normalizeMoney(payload?.net)
+  const hours = normalizeMoney(payload?.hours)
+  const entryCount = normalizeInteger(payload?.entry_count || payload?.entryCount)
+
+  if (!periodStart || !periodEnd || !payday) {
+    return { success: false, error: '급여 기간과 지급일이 필요합니다.', status: 400 }
+  }
+
+  if (net <= 0) {
+    return { success: false, error: 'Budget에 보낼 실수령 금액이 없습니다.', status: 400 }
+  }
+
+  const runKey = String(
+    payload?.run_key ||
+    payload?.runKey ||
+    `${summaryMode}:${periodStart}:${periodEnd}:${payday}`
+  )
+  const existing = await DB.prepare(`
+    SELECT id, budget_transaction_id
+    FROM employeeee_pay_runs
+    WHERE user_id = ? AND run_key = ?
+  `).bind(userId, runKey).first() as any
+
+  if (existing?.budget_transaction_id) {
+    return {
+      success: true,
+      already_exported: true,
+      pay_run_id: existing.id,
+      transaction_id: existing.budget_transaction_id
+    }
+  }
+
+  const category = String(payload?.category || '급여')
+  const description = String(
+    payload?.description ||
+    `employeeee 급여 ${periodStart} ~ ${periodEnd}${currency ? ` (${currency})` : ''}`
+  )
+  const accountLinkingEnabled = await hasPersonalAccountLinking(DB)
+  const transactionResult = accountLinkingEnabled
+    ? await DB.prepare(`
+        INSERT INTO transactions (type, category, amount, description, date, payment_method, savings_account_id, account_id, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind('income', category, net, description, payday, 'transfer', null, null, userId.toString()).run()
+    : await DB.prepare(`
+        INSERT INTO transactions (type, category, amount, description, date, payment_method, savings_account_id, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind('income', category, net, description, payday, 'transfer', null, userId.toString()).run()
+
+  const transactionId = transactionResult.meta.last_row_id as number
+  const summaryJson = JSON.stringify({
+    ...payload,
+    period_start: periodStart,
+    period_end: periodEnd,
+    payday,
+    summary_mode: summaryMode,
+    currency,
+    gross,
+    deductions,
+    net,
+    hours,
+    entry_count: entryCount,
+    budget_transaction_id: transactionId
+  })
+
+  const payRunResult = await DB.prepare(`
+    INSERT INTO employeeee_pay_runs (
+      user_id, run_key, summary_mode, period_start, period_end, payday,
+      currency, gross, deductions, net, hours, entry_count, summary_json,
+      budget_transaction_id, exported_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    ON CONFLICT(user_id, run_key) DO UPDATE SET
+      summary_mode = excluded.summary_mode,
+      period_start = excluded.period_start,
+      period_end = excluded.period_end,
+      payday = excluded.payday,
+      currency = excluded.currency,
+      gross = excluded.gross,
+      deductions = excluded.deductions,
+      net = excluded.net,
+      hours = excluded.hours,
+      entry_count = excluded.entry_count,
+      summary_json = excluded.summary_json,
+      budget_transaction_id = COALESCE(employeeee_pay_runs.budget_transaction_id, excluded.budget_transaction_id),
+      exported_at = COALESCE(employeeee_pay_runs.exported_at, CURRENT_TIMESTAMP),
+      updated_at = CURRENT_TIMESTAMP
+  `).bind(
+    userId,
+    runKey,
+    summaryMode,
+    periodStart,
+    periodEnd,
+    payday,
+    currency || null,
+    gross,
+    deductions,
+    net,
+    hours,
+    entryCount,
+    summaryJson,
+    transactionId
+  ).run()
+
+  await recalcMonthlySummary(DB, userId, payday.substring(0, 7))
+
+  return {
+    success: true,
+    already_exported: false,
+    pay_run_id: payRunResult.meta.last_row_id || existing?.id,
+    transaction_id: transactionId
+  }
 }
 
 async function getAccessibleWallets(DB: D1Database, userId: number): Promise<any[]> {
@@ -1182,6 +1322,34 @@ app.put('/api/employeeee/sync', authMiddleware, async (c) => {
 
   const data = await readEmployeeeeBootstrap(DB, userId)
   return c.json({ success: true, data })
+})
+
+app.post('/api/employeeee/pay-runs/export-budget', authMiddleware, async (c) => {
+  const { DB } = c.env
+  const userId = getRequiredSharedUserId(c)
+
+  if (!userId) {
+    return c.json({ success: false, error: '공통 계정 로그인이 필요합니다.' }, 401)
+  }
+
+  const payload = await c.req.json()
+  const result = await exportEmployeeeePayRunToBudget(DB, userId, payload)
+
+  if (!result.success) {
+    return c.json(
+      { success: false, error: result.error || 'Budget-Lee 거래 생성에 실패했습니다.' },
+      result.status || 400
+    )
+  }
+
+  return c.json({
+    success: true,
+    data: {
+      already_exported: result.already_exported,
+      pay_run_id: result.pay_run_id,
+      transaction_id: result.transaction_id
+    }
+  })
 })
 
 // API 엔드포인트 - 저축 통장
