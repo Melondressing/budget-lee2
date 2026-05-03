@@ -136,6 +136,92 @@ function mapSharedWalletAccount(row: any): any {
   }
 }
 
+function getRequiredSharedUserId(c: any): number | null {
+  const authHeader = c.req.header('Authorization') || ''
+  const userId = Number(c.get('userId'))
+
+  if (!authHeader.startsWith('Bearer ') || !Number.isInteger(userId) || userId <= 0) {
+    return null
+  }
+
+  return userId
+}
+
+function parseJsonColumn(value: unknown, fallback: any): any {
+  if (typeof value !== 'string' || value.length === 0) return fallback
+  try {
+    return JSON.parse(value)
+  } catch {
+    return fallback
+  }
+}
+
+function normalizeEmployeeeeEntry(entry: any): any | null {
+  if (!entry || typeof entry !== 'object') return null
+  const id = typeof entry.id === 'string' && entry.id.trim().length > 0 ? entry.id.trim() : null
+  const date = typeof entry.date === 'string' && entry.date.trim().length >= 10 ? entry.date.trim() : null
+  if (!id || !date) return null
+  return {
+    id,
+    date: date.substring(0, 10),
+    json: JSON.stringify(entry)
+  }
+}
+
+async function readEmployeeeeBootstrap(DB: D1Database, userId: number): Promise<{ pay_rule: any | null; work_entries: any[] }> {
+  const [ruleRow, entriesResult] = await Promise.all([
+    DB.prepare(`
+      SELECT rule_json
+      FROM employeeee_pay_rules
+      WHERE user_id = ?
+    `).bind(userId).first() as Promise<any>,
+    DB.prepare(`
+      SELECT entry_json
+      FROM employeeee_work_entries
+      WHERE user_id = ?
+      ORDER BY entry_date ASC, created_at ASC
+    `).bind(userId).all()
+  ])
+
+  return {
+    pay_rule: parseJsonColumn(ruleRow?.rule_json, null),
+    work_entries: ((entriesResult.results || []) as any[])
+      .map((row: any) => parseJsonColumn(row.entry_json, null))
+      .filter(Boolean)
+  }
+}
+
+async function saveEmployeeeePayRule(DB: D1Database, userId: number, payRule: any): Promise<void> {
+  await DB.prepare(`
+    INSERT INTO employeeee_pay_rules (user_id, rule_json, updated_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(user_id) DO UPDATE SET
+      rule_json = excluded.rule_json,
+      updated_at = CURRENT_TIMESTAMP
+  `).bind(userId, JSON.stringify(payRule || {})).run()
+}
+
+async function replaceEmployeeeeWorkEntries(DB: D1Database, userId: number, entries: any[]): Promise<void> {
+  const normalized = entries
+    .map(normalizeEmployeeeeEntry)
+    .filter(Boolean) as Array<{ id: string; date: string; json: string }>
+
+  const statements: D1PreparedStatement[] = [
+    DB.prepare(`DELETE FROM employeeee_work_entries WHERE user_id = ?`).bind(userId)
+  ]
+
+  for (const entry of normalized) {
+    statements.push(
+      DB.prepare(`
+        INSERT INTO employeeee_work_entries (user_id, entry_id, entry_date, entry_json, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      `).bind(userId, entry.id, entry.date, entry.json)
+    )
+  }
+
+  await DB.batch(statements)
+}
+
 async function getAccessibleWallets(DB: D1Database, userId: number): Promise<any[]> {
   const result = await DB.prepare(`
     SELECT
@@ -1026,6 +1112,76 @@ app.get('/api/auth/me', authMiddleware, async (c) => {
       lastLogin: user.last_login
     }
   })
+})
+
+// ========== employeeee shared payroll data API ==========
+
+app.get('/api/employeeee/bootstrap', authMiddleware, async (c) => {
+  const { DB } = c.env
+  const userId = getRequiredSharedUserId(c)
+
+  if (!userId) {
+    return c.json({ success: false, error: '공통 계정 로그인이 필요합니다.' }, 401)
+  }
+
+  const data = await readEmployeeeeBootstrap(DB, userId)
+  return c.json({ success: true, data })
+})
+
+app.put('/api/employeeee/pay-rule', authMiddleware, async (c) => {
+  const { DB } = c.env
+  const userId = getRequiredSharedUserId(c)
+
+  if (!userId) {
+    return c.json({ success: false, error: '공통 계정 로그인이 필요합니다.' }, 401)
+  }
+
+  const payload = await c.req.json()
+  const payRule = payload?.pay_rule ?? payload
+
+  await saveEmployeeeePayRule(DB, userId, payRule)
+  return c.json({ success: true })
+})
+
+app.put('/api/employeeee/work-entries', authMiddleware, async (c) => {
+  const { DB } = c.env
+  const userId = getRequiredSharedUserId(c)
+
+  if (!userId) {
+    return c.json({ success: false, error: '공통 계정 로그인이 필요합니다.' }, 401)
+  }
+
+  const payload = await c.req.json()
+  const entries = Array.isArray(payload?.work_entries)
+    ? payload.work_entries
+    : Array.isArray(payload?.entries)
+      ? payload.entries
+      : []
+
+  await replaceEmployeeeeWorkEntries(DB, userId, entries)
+  return c.json({ success: true, count: entries.length })
+})
+
+app.put('/api/employeeee/sync', authMiddleware, async (c) => {
+  const { DB } = c.env
+  const userId = getRequiredSharedUserId(c)
+
+  if (!userId) {
+    return c.json({ success: false, error: '공통 계정 로그인이 필요합니다.' }, 401)
+  }
+
+  const payload = await c.req.json()
+
+  if (payload && Object.prototype.hasOwnProperty.call(payload, 'pay_rule')) {
+    await saveEmployeeeePayRule(DB, userId, payload.pay_rule)
+  }
+
+  if (Array.isArray(payload?.work_entries)) {
+    await replaceEmployeeeeWorkEntries(DB, userId, payload.work_entries)
+  }
+
+  const data = await readEmployeeeeBootstrap(DB, userId)
+  return c.json({ success: true, data })
 })
 
 // API 엔드포인트 - 저축 통장
