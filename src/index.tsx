@@ -138,9 +138,10 @@ function mapSharedWalletAccount(row: any): any {
 
 function getRequiredSharedUserId(c: any): number | null {
   const authHeader = c.req.header('Authorization') || ''
+  const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : ''
   const userId = Number(c.get('userId'))
 
-  if (!authHeader.startsWith('Bearer ') || !Number.isInteger(userId) || userId <= 0) {
+  if (!token.startsWith('eyJ') || !Number.isInteger(userId) || userId <= 0) {
     return null
   }
 
@@ -168,6 +169,19 @@ function normalizeEmployeeeeEntry(entry: any): any | null {
   }
 }
 
+function employeeeeEntryUpdatedMs(entry: any): number {
+  const raw = entry?.updatedAt || entry?.updated_at || entry?.date
+  const parsed = typeof raw === 'string' ? Date.parse(raw) : Number.NaN
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function d1TimestampMs(value: unknown): number {
+  if (typeof value !== 'string' || value.trim().length === 0) return 0
+  const isoLike = value.includes('T') ? value : value.replace(' ', 'T') + 'Z'
+  const parsed = Date.parse(isoLike)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
 function normalizeDateString(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()
@@ -187,8 +201,8 @@ function normalizeInteger(value: unknown): number {
   return Math.max(0, Math.round(numberValue))
 }
 
-async function readEmployeeeeBootstrap(DB: D1Database, userId: number): Promise<{ pay_rule: any | null; work_entries: any[] }> {
-  const [ruleRow, entriesResult] = await Promise.all([
+async function readEmployeeeeBootstrap(DB: D1Database, userId: number): Promise<{ pay_rule: any | null; work_entries: any[]; deleted_entries: any[] }> {
+  const [ruleRow, entriesResult, deletionsResult] = await Promise.all([
     DB.prepare(`
       SELECT rule_json
       FROM employeeee_pay_rules
@@ -200,13 +214,24 @@ async function readEmployeeeeBootstrap(DB: D1Database, userId: number): Promise<
       WHERE user_id = ?
       ORDER BY entry_date ASC, created_at ASC
     `).bind(userId).all()
+    ,
+    DB.prepare(`
+      SELECT entry_id, deleted_at
+      FROM employeeee_work_entry_deletions
+      WHERE user_id = ?
+      ORDER BY deleted_at ASC
+    `).bind(userId).all()
   ])
 
   return {
     pay_rule: parseJsonColumn(ruleRow?.rule_json, null),
     work_entries: ((entriesResult.results || []) as any[])
       .map((row: any) => parseJsonColumn(row.entry_json, null))
-      .filter(Boolean)
+      .filter(Boolean),
+    deleted_entries: ((deletionsResult.results || []) as any[]).map((row: any) => ({
+      entry_id: row.entry_id,
+      deleted_at: row.deleted_at
+    }))
   }
 }
 
@@ -221,24 +246,57 @@ async function saveEmployeeeePayRule(DB: D1Database, userId: number, payRule: an
 }
 
 async function replaceEmployeeeeWorkEntries(DB: D1Database, userId: number, entries: any[]): Promise<void> {
-  const normalized = entries
-    .map(normalizeEmployeeeeEntry)
-    .filter(Boolean) as Array<{ id: string; date: string; json: string }>
+  for (const entry of entries) {
+    await upsertEmployeeeeWorkEntry(DB, userId, entry)
+  }
+}
 
-  const statements: D1PreparedStatement[] = [
-    DB.prepare(`DELETE FROM employeeee_work_entries WHERE user_id = ?`).bind(userId)
-  ]
+async function upsertEmployeeeeWorkEntry(DB: D1Database, userId: number, entry: any): Promise<{ saved: boolean; stale: boolean }> {
+  const normalized = normalizeEmployeeeeEntry(entry)
+  if (!normalized) return { saved: false, stale: false }
 
-  for (const entry of normalized) {
-    statements.push(
-      DB.prepare(`
-        INSERT INTO employeeee_work_entries (user_id, entry_id, entry_date, entry_json, updated_at)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-      `).bind(userId, entry.id, entry.date, entry.json)
-    )
+  const deletion = await DB.prepare(`
+    SELECT deleted_at
+    FROM employeeee_work_entry_deletions
+    WHERE user_id = ? AND entry_id = ?
+  `).bind(userId, normalized.id).first() as any
+
+  const deletedAtMs = d1TimestampMs(deletion?.deleted_at)
+  if (deletedAtMs > 0 && employeeeeEntryUpdatedMs(entry) <= deletedAtMs) {
+    return { saved: false, stale: true }
   }
 
-  await DB.batch(statements)
+  await DB.batch([
+    DB.prepare(`
+      DELETE FROM employeeee_work_entry_deletions
+      WHERE user_id = ? AND entry_id = ?
+    `).bind(userId, normalized.id),
+    DB.prepare(`
+      INSERT INTO employeeee_work_entries (user_id, entry_id, entry_date, entry_json, updated_at)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id, entry_id) DO UPDATE SET
+        entry_date = excluded.entry_date,
+        entry_json = excluded.entry_json,
+        updated_at = CURRENT_TIMESTAMP
+    `).bind(userId, normalized.id, normalized.date, normalized.json)
+  ])
+
+  return { saved: true, stale: false }
+}
+
+async function deleteEmployeeeeWorkEntry(DB: D1Database, userId: number, entryId: string): Promise<void> {
+  await DB.batch([
+    DB.prepare(`
+      DELETE FROM employeeee_work_entries
+      WHERE user_id = ? AND entry_id = ?
+    `).bind(userId, entryId),
+    DB.prepare(`
+      INSERT INTO employeeee_work_entry_deletions (user_id, entry_id, deleted_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id, entry_id) DO UPDATE SET
+        deleted_at = CURRENT_TIMESTAMP
+    `).bind(userId, entryId)
+  ])
 }
 
 async function exportEmployeeeePayRunToBudget(DB: D1Database, userId: number, payload: any): Promise<any> {
@@ -1300,6 +1358,44 @@ app.put('/api/employeeee/work-entries', authMiddleware, async (c) => {
 
   await replaceEmployeeeeWorkEntries(DB, userId, entries)
   return c.json({ success: true, count: entries.length })
+})
+
+app.put('/api/employeeee/work-entries/:entryId', authMiddleware, async (c) => {
+  const { DB } = c.env
+  const userId = getRequiredSharedUserId(c)
+
+  if (!userId) {
+    return c.json({ success: false, error: '공통 계정 로그인이 필요합니다.' }, 401)
+  }
+
+  const entryId = c.req.param('entryId')
+  const payload = await c.req.json()
+  const entry = payload?.work_entry ?? payload?.entry ?? payload
+
+  if (!entry || typeof entry !== 'object') {
+    return c.json({ success: false, error: '근무기록 데이터가 필요합니다.' }, 400)
+  }
+
+  const normalizedEntry = { ...entry, id: entryId }
+  const result = await upsertEmployeeeeWorkEntry(DB, userId, normalizedEntry)
+  if (!result.saved && !result.stale) {
+    return c.json({ success: false, error: '근무기록 날짜/ID가 올바르지 않습니다.' }, 400)
+  }
+
+  return c.json({ success: true, entry_id: entryId, stale: result.stale })
+})
+
+app.delete('/api/employeeee/work-entries/:entryId', authMiddleware, async (c) => {
+  const { DB } = c.env
+  const userId = getRequiredSharedUserId(c)
+
+  if (!userId) {
+    return c.json({ success: false, error: '공통 계정 로그인이 필요합니다.' }, 401)
+  }
+
+  const entryId = c.req.param('entryId')
+  await deleteEmployeeeeWorkEntry(DB, userId, entryId)
+  return c.json({ success: true, entry_id: entryId })
 })
 
 app.put('/api/employeeee/sync', authMiddleware, async (c) => {
