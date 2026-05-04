@@ -280,6 +280,51 @@ function formatInvestmentQuantity(quantity) {
   });
 }
 
+function inferInvestmentCurrency(symbol, priceData = null) {
+  if (priceData?.currency) {
+    return String(priceData.currency).toUpperCase();
+  }
+
+  const normalized = String(symbol || '').trim().toUpperCase();
+  const cryptoSymbols = ['BTC', 'ETH', 'BNB', 'XRP', 'SOL', 'ADA', 'DOGE', 'DOT', 'MATIC', 'AVAX'];
+
+  if (normalized.endsWith('.KS') || normalized.endsWith('.KQ')) return 'KRW';
+  if (normalized.endsWith('.AX')) return 'AUD';
+  if (normalized.endsWith('.US') || normalized.endsWith('-USD') || cryptoSymbols.includes(normalized)) return 'USD';
+  if (normalized.endsWith('.L')) return 'GBP';
+  if (normalized.endsWith('.T')) return 'JPY';
+  if (normalized.endsWith('.TO') || normalized.endsWith('.V')) return 'CAD';
+  if (normalized.endsWith('.HK')) return 'HKD';
+  if (normalized.endsWith('.SI')) return 'SGD';
+  if (normalized.endsWith('.PA') || normalized.endsWith('.MI') || normalized.endsWith('.DE') || normalized.endsWith('.AS')) return 'EUR';
+
+  return String(state.settings.currency || 'KRW').toUpperCase();
+}
+
+function getInvestmentFxRate(fromCurrency, toCurrency, fxRates = {}) {
+  const from = String(fromCurrency || '').toUpperCase();
+  const to = String(toCurrency || '').toUpperCase();
+
+  if (!from || !to || from === to) return 1;
+
+  const rate = Number(fxRates[from]?.rate);
+  return Number.isFinite(rate) && rate > 0 ? rate : null;
+}
+
+function renderConvertedInvestmentValue(amount, fromCurrency, toCurrency, fxRates = {}) {
+  const rate = getInvestmentFxRate(fromCurrency, toCurrency, fxRates);
+
+  if (String(fromCurrency || '').toUpperCase() === String(toCurrency || '').toUpperCase()) {
+    return '';
+  }
+
+  if (!rate) {
+    return `<div class="text-xs text-amber-600">${getLanguage() === 'ko' ? '환율 미적용' : 'FX unavailable'}</div>`;
+  }
+
+  return `<div class="text-xs text-gray-500">≈ ${formatInvestmentMoney(Number(amount || 0) * rate, toCurrency)}</div>`;
+}
+
 function getWalletAccountTypes() {
   return [
     { value: 'checking', label: t('wallet.type.checking'), icon: 'fa-university', accent: 'blue' },
@@ -4235,6 +4280,7 @@ async function renderInvestmentsView() {
           <div class="text-sm text-sky-900">
             <p class="font-medium mb-1">${t('investment.realtime_info')}</p>
             <p>${getLanguage() === 'ko' ? 'Yahoo Finance 현재가를 기준으로 평가금액과 수익률을 갱신합니다. 더 이상 시뮬레이션 가격을 실제처럼 섞어 표시하지 않습니다.' : 'Market value and returns are updated from Yahoo Finance quotes. Simulated prices are no longer mixed into live results.'}</p>
+            <p class="mt-1">${getLanguage() === 'ko' ? '총 투자금/평가금액/손익은 설정 통화로 자동 환산하고, 각 행에는 원래 통화 금액도 함께 표시합니다.' : 'Portfolio totals are automatically converted into your settings currency, while each row still shows the asset currency.'}</p>
             <p class="mt-1">${getLanguage() === 'ko' ? '매수가도 해당 종목의 거래 통화 기준으로 입력하면 가장 정확합니다.' : 'For best results, enter purchase prices in the same currency as the asset quote.'}</p>
             <p class="mt-2 text-xs">
               <strong>${t('investment.supported_symbols')}</strong>
@@ -4314,22 +4360,23 @@ async function updateInvestmentPrices() {
   const totalCurrentValueEl = document.getElementById('total-current-value');
   const totalProfitLossEl = document.getElementById('total-profit-loss');
   const priceStatusEl = document.getElementById('investment-price-status');
+  const summaryCurrency = String(state.settings.currency || 'KRW').toUpperCase();
 
   if (!investmentsList || state.investments.length === 0) {
     if (investmentsList) {
       investmentsList.innerHTML = `<tr><td colspan="8" class="px-4 py-8 text-center text-gray-500">${t('investment.no_holdings')}</td></tr>`;
     }
-    if (totalInvestmentEl) totalInvestmentEl.textContent = formatInvestmentMoney(0);
-    if (totalCurrentValueEl) totalCurrentValueEl.textContent = formatInvestmentMoney(0);
-    if (totalProfitLossEl) totalProfitLossEl.textContent = formatInvestmentMoney(0);
+    if (totalInvestmentEl) totalInvestmentEl.textContent = formatInvestmentMoney(0, summaryCurrency);
+    if (totalCurrentValueEl) totalCurrentValueEl.textContent = formatInvestmentMoney(0, summaryCurrency);
+    if (totalProfitLossEl) totalProfitLossEl.textContent = formatInvestmentMoney(0, summaryCurrency);
     if (priceStatusEl) priceStatusEl.textContent = '';
     return;
   }
 
   if (priceStatusEl) {
     priceStatusEl.textContent = getLanguage() === 'ko'
-      ? '현재가를 불러오는 중...'
-      : 'Loading current quotes...';
+      ? '현재가와 환율을 불러오는 중...'
+      : 'Loading quotes and FX rates...';
   }
 
   let totalInvestment = 0;
@@ -4337,10 +4384,13 @@ async function updateInvestmentPrices() {
   let rowsHTML = '';
   let quotedCount = 0;
   let failedCount = 0;
+  let unconvertedCount = 0;
   const symbols = [...new Set(state.investments.map(inv => String(inv.symbol || '').trim().toUpperCase()).filter(Boolean))];
   let quotes = {};
   let quoteErrors = {};
   let quoteCacheMap = {};
+  let fxRates = {};
+  let fxErrors = {};
 
   try {
     const priceResponse = await axios.get(`/api/investments/prices?symbols=${encodeURIComponent(symbols.join(','))}`);
@@ -4357,31 +4407,69 @@ async function updateInvestmentPrices() {
     }, {});
   }
 
+  const currenciesToConvert = [...new Set(state.investments.map(inv => {
+    const symbol = String(inv.symbol || '').trim().toUpperCase();
+    return inferInvestmentCurrency(symbol, quotes[symbol]);
+  }).filter(currency => currency && currency !== summaryCurrency))];
+
+  if (currenciesToConvert.length > 0) {
+    try {
+      const fxResponse = await axios.get(`/api/investments/fx-rates?to=${encodeURIComponent(summaryCurrency)}&from=${encodeURIComponent(currenciesToConvert.join(','))}`);
+      if (fxResponse.data.success) {
+        fxRates = fxResponse.data.data || {};
+        fxErrors = fxResponse.data.errors || {};
+      }
+    } catch (error) {
+      console.error('Failed to fetch investment FX rates:', error);
+      fxErrors = currenciesToConvert.reduce((acc, currency) => {
+        acc[currency] = '환율 정보를 불러올 수 없습니다.';
+        return acc;
+      }, {});
+    }
+  }
+
   for (const inv of state.investments) {
     const symbol = String(inv.symbol || '').trim().toUpperCase();
     const priceData = quotes[symbol];
     const quantity = Number(inv.quantity || 0);
     const purchasePrice = Number(inv.purchase_price || 0);
-    const currency = priceData?.currency || state.settings.currency || 'KRW';
+    const currency = inferInvestmentCurrency(symbol, priceData);
+    const conversionRate = getInvestmentFxRate(currency, summaryCurrency, fxRates);
+    const isConverted = currency === summaryCurrency || conversionRate !== null;
+    const rateForSummary = conversionRate || 1;
     const purchaseValue = purchasePrice * quantity;
+    const purchaseValueSummary = purchaseValue * rateForSummary;
+    const fxBadge = currency !== summaryCurrency && conversionRate
+      ? `<span class="ml-1 rounded-full bg-cyan-50 px-2 py-0.5 text-[11px] font-medium text-cyan-700" title="${currency} → ${summaryCurrency}">FX</span>`
+      : '';
 
-    totalInvestment += purchaseValue;
+    if (!isConverted) {
+      unconvertedCount += 1;
+    }
+
+    totalInvestment += purchaseValueSummary;
 
     if (!priceData || !Number.isFinite(Number(priceData.price)) || Number(priceData.price) <= 0) {
       failedCount += 1;
-      totalCurrentValue += purchaseValue;
+      totalCurrentValue += purchaseValueSummary;
       const errorMessage = quoteErrors[symbol] || (getLanguage() === 'ko' ? '현재가를 찾을 수 없습니다.' : 'Quote unavailable.');
+      const fxMessage = !isConverted && currency !== summaryCurrency
+        ? `<div class="text-xs text-amber-600 mt-1">${fxErrors[currency] || (getLanguage() === 'ko' ? '환율 미적용' : 'FX unavailable')}</div>`
+        : '';
 
       rowsHTML += `
         <tr class="border-t hover:bg-gray-50">
           <td class="px-4 py-3">
             <div class="font-medium">${inv.name}</div>
-            <div class="text-sm text-gray-500">${symbol}</div>
+            <div class="text-sm text-gray-500">${symbol}${fxBadge}</div>
           </td>
           <td class="px-4 py-3 text-right">${formatInvestmentQuantity(quantity)}${t('investment.shares')}</td>
-          <td class="px-4 py-3 text-right">${formatInvestmentMoney(purchasePrice, currency)}</td>
+          <td class="px-4 py-3 text-right">
+            <div>${formatInvestmentMoney(purchasePrice, currency)}</div>
+            ${renderConvertedInvestmentValue(purchasePrice, currency, summaryCurrency, fxRates)}
+          </td>
           <td colspan="4" class="px-4 py-3 text-center text-amber-600">
-            <i class="fas fa-triangle-exclamation mr-1"></i>${errorMessage}
+            <i class="fas fa-triangle-exclamation mr-1"></i>${errorMessage}${fxMessage}
           </td>
           <td class="px-4 py-3 text-center">
             <button onclick="editInvestment(${inv.id})"
@@ -4404,13 +4492,15 @@ async function updateInvestmentPrices() {
 
     const currentPrice = Number(priceData.price);
     const currentValue = currentPrice * quantity;
+    const currentValueSummary = currentValue * rateForSummary;
     const profitLoss = currentValue - purchaseValue;
-    const profitLossPercent = purchaseValue > 0 ? (profitLoss / purchaseValue * 100).toFixed(2) : '0.00';
+    const profitLossSummary = currentValueSummary - purchaseValueSummary;
+    const profitLossPercent = purchaseValueSummary > 0 ? (profitLossSummary / purchaseValueSummary * 100).toFixed(2) : '0.00';
 
-    totalCurrentValue += currentValue;
+    totalCurrentValue += currentValueSummary;
 
-    const profitClass = profitLoss >= 0 ? 'text-red-600' : 'text-blue-600';
-    const profitSign = profitLoss >= 0 ? '+' : '';
+    const profitClass = profitLossSummary >= 0 ? 'text-red-600' : 'text-blue-600';
+    const profitSign = profitLossSummary >= 0 ? '+' : '';
     const change = Number(priceData.change || 0);
     const changePercent = Number(priceData.changePercent || 0);
     const changeClass = change >= 0 ? 'text-red-600' : 'text-blue-600';
@@ -4420,26 +4510,40 @@ async function updateInvestmentPrices() {
     const providerBadge = priceData.providerSymbol && priceData.providerSymbol !== symbol
       ? `<span class="ml-1 text-xs text-gray-400">${priceData.providerSymbol}</span>`
       : '';
+    const convertedMarketValue = renderConvertedInvestmentValue(currentValue, currency, summaryCurrency, fxRates);
+    const convertedPurchasePrice = renderConvertedInvestmentValue(purchasePrice, currency, summaryCurrency, fxRates);
+    const originalProfitLossLine = currency !== summaryCurrency
+      ? `<div class="text-xs text-gray-500">${profitLoss >= 0 ? '+' : ''}${formatInvestmentMoney(Math.abs(profitLoss), currency)}</div>`
+      : '';
 
     rowsHTML += `
       <tr class="border-t hover:bg-gray-50">
         <td class="px-4 py-3">
           <div class="font-medium">${inv.name}</div>
           <div class="text-sm text-gray-500">
-            ${symbol}${providerBadge}${cachedBadge}
+            ${symbol}${providerBadge}${cachedBadge}${fxBadge}
           </div>
         </td>
         <td class="px-4 py-3 text-right">${formatInvestmentQuantity(quantity)}${t('investment.shares')}</td>
-        <td class="px-4 py-3 text-right">${formatInvestmentMoney(purchasePrice, currency)}</td>
+        <td class="px-4 py-3 text-right">
+          <div>${formatInvestmentMoney(purchasePrice, currency)}</div>
+          ${convertedPurchasePrice}
+        </td>
         <td class="px-4 py-3 text-right">
           <div>${formatInvestmentMoney(currentPrice, currency)}</div>
           <div class="text-sm ${changeClass}">
             ${change >= 0 ? '▲' : '▼'} ${Math.abs(changePercent).toFixed(2)}%
           </div>
         </td>
-        <td class="px-4 py-3 text-right font-medium">${formatInvestmentMoney(currentValue, currency)}</td>
+        <td class="px-4 py-3 text-right font-medium">
+          <div>${formatInvestmentMoney(currentValue, currency)}</div>
+          ${convertedMarketValue}
+        </td>
         <td class="px-4 py-3 text-right ${profitClass} font-medium">${profitSign}${profitLossPercent}%</td>
-        <td class="px-4 py-3 text-right ${profitClass} font-medium">${profitSign}${formatInvestmentMoney(Math.abs(profitLoss), currency)}</td>
+        <td class="px-4 py-3 text-right ${profitClass} font-medium">
+          <div>${profitSign}${formatInvestmentMoney(Math.abs(profitLossSummary), summaryCurrency)}</div>
+          ${originalProfitLossLine}
+        </td>
         <td class="px-4 py-3 text-center">
           <button onclick="editInvestment(${inv.id})"
                   class="px-2 py-1 text-blue-600 hover:bg-blue-50 text-xs rounded mr-1"
@@ -4463,7 +4567,6 @@ async function updateInvestmentPrices() {
   const totalProfitLossPercent = totalInvestment > 0 ? ((totalProfitLoss / totalInvestment) * 100).toFixed(2) : 0;
   const profitClass = totalProfitLoss >= 0 ? 'text-red-600' : 'text-blue-600';
   const profitSign = totalProfitLoss >= 0 ? '+' : '';
-  const summaryCurrency = state.settings.currency || 'KRW';
 
   if (totalInvestmentEl) totalInvestmentEl.textContent = formatInvestmentMoney(totalInvestment, summaryCurrency);
   if (totalCurrentValueEl) totalCurrentValueEl.textContent = formatInvestmentMoney(totalCurrentValue, summaryCurrency);
@@ -4478,12 +4581,16 @@ async function updateInvestmentPrices() {
       hour: '2-digit',
       minute: '2-digit'
     });
+    const fxAppliedCount = Object.keys(fxRates).length;
+    const fxFailedCount = Object.keys(fxErrors).length;
+    const fxStatus = getLanguage() === 'ko'
+      ? `${summaryCurrency} 환산 ${fxAppliedCount}개 통화${fxFailedCount ? `, 환율 실패 ${fxFailedCount}개` : ''}${unconvertedCount ? `, 미환산 ${unconvertedCount}개` : ''}`
+      : `${fxAppliedCount} currencies converted to ${summaryCurrency}${fxFailedCount ? `, ${fxFailedCount} FX failures` : ''}${unconvertedCount ? `, ${unconvertedCount} unconverted` : ''}`;
     priceStatusEl.textContent = getLanguage() === 'ko'
-      ? `Yahoo Finance 기준 ${quotedCount}개 반영, ${failedCount}개는 매수가 기준 유지 · ${nowText} 갱신`
-      : `Yahoo Finance quotes applied: ${quotedCount}; ${failedCount} kept at purchase cost · Updated ${nowText}`;
+      ? `Yahoo Finance 기준 ${quotedCount}개 반영, ${failedCount}개는 매수가 기준 유지 · ${fxStatus} · ${nowText} 갱신`
+      : `Yahoo Finance quotes applied: ${quotedCount}; ${failedCount} kept at purchase cost · ${fxStatus} · Updated ${nowText}`;
   }
 }
-
 function startInvestmentPriceRefresh() {
   // 기존 인터벌 제거
   if (state.investmentPriceRefreshInterval) {

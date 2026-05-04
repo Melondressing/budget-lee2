@@ -65,6 +65,33 @@ type InvestmentQuote = {
   simulated: false;
 }
 
+type FxRate = {
+  from: string;
+  to: string;
+  rate: number;
+  providerSymbol: string;
+  inverted: boolean;
+  regularMarketTime: number | null;
+  source: 'yahoo' | 'identity';
+}
+
+type YahooChartSnapshot = {
+  symbol: string;
+  providerSymbol: string;
+  price: number;
+  previousClose: number;
+  change: number;
+  changePercent: number;
+  currency: string | null;
+  marketState: string;
+  fullExchangeName: string | null;
+  exchangeName: string | null;
+  shortName: string | null;
+  longName: string | null;
+  quoteType: string | null;
+  regularMarketTime: number | null;
+}
+
 const CRYPTO_PROVIDER_SYMBOLS: Record<string, string> = {
   BTC: 'BTC-USD',
   ETH: 'ETH-USD',
@@ -113,6 +140,66 @@ function inferQuoteCurrency(providerSymbol: string): string {
   if (providerSymbol.endsWith('.KS') || providerSymbol.endsWith('.KQ')) return 'KRW'
   if (providerSymbol.endsWith('-USD')) return 'USD'
   return 'USD'
+}
+
+function normalizeCurrencyCode(rawCurrency: string): string {
+  return String(rawCurrency || '').trim().toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3)
+}
+
+async function fetchYahooChartSnapshot(providerSymbol: string): Promise<YahooChartSnapshot> {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(providerSymbol)}?range=1d&interval=1d`
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 BudgetLee/1.0',
+      'Accept': 'application/json',
+    },
+  })
+
+  if (!response.ok) {
+    throw new Error(`Yahoo Finance API returned ${response.status}`)
+  }
+
+  const json = await response.json() as any
+  const chartError = json?.chart?.error
+  const chartResult = json?.chart?.result?.[0]
+  const meta = chartResult?.meta
+  const lastClose = getLastFiniteNumber(chartResult?.indicators?.quote?.[0]?.close)
+
+  if (chartError) {
+    throw new Error(chartError.description || chartError.code || 'Yahoo chart API error')
+  }
+
+  if (!meta) {
+    throw new Error('No quote data found')
+  }
+
+  const price = readQuoteNumber(meta, ['regularMarketPrice']) ?? lastClose
+  if (!price || price <= 0) {
+    throw new Error('No live market price found')
+  }
+
+  const previousClose = readQuoteNumber(meta, ['chartPreviousClose', 'previousClose']) ?? price
+  const change = price !== null && previousClose !== null ? price - previousClose : 0
+  const changePercent = previousClose && previousClose > 0 ? (change / previousClose) * 100 : 0
+
+  return {
+    symbol: String(meta.symbol || providerSymbol).toUpperCase(),
+    providerSymbol,
+    price,
+    previousClose,
+    change,
+    changePercent,
+    currency: meta.currency || null,
+    marketState: meta.marketState || 'UNKNOWN',
+    fullExchangeName: meta.fullExchangeName || null,
+    exchangeName: meta.exchangeName || null,
+    shortName: meta.shortName || null,
+    longName: meta.longName || null,
+    quoteType: meta.instrumentType || null,
+    regularMarketTime: Number.isFinite(Number(meta.regularMarketTime))
+      ? Number(meta.regularMarketTime)
+      : null,
+  }
 }
 
 function mapYahooQuoteToInvestmentQuote(
@@ -176,51 +263,22 @@ async function fetchYahooInvestmentQuote(rawSymbol: string): Promise<{ data: Inv
     }
   }
 
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(providerSymbol)}?range=1d&interval=1d`
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 BudgetLee/1.0',
-      'Accept': 'application/json',
-    },
-  })
-
-  if (!response.ok) {
-    throw new Error(`Yahoo Finance API returned ${response.status}`)
-  }
-
-  const json = await response.json() as any
-  const chartError = json?.chart?.error
-  const chartResult = json?.chart?.result?.[0]
-  const meta = chartResult?.meta
-  const lastClose = getLastFiniteNumber(chartResult?.indicators?.quote?.[0]?.close)
-
-  if (chartError) {
-    throw new Error(chartError.description || chartError.code || 'Yahoo chart API error')
-  }
-
-  if (!meta) {
-    throw new Error('No quote data found')
-  }
-
-  const price = readQuoteNumber(meta, ['regularMarketPrice']) ?? lastClose
-  const previousClose = readQuoteNumber(meta, ['chartPreviousClose', 'previousClose']) ?? price
-  const change = price !== null && previousClose !== null ? price - previousClose : 0
-  const changePercent = previousClose && previousClose > 0 ? (change / previousClose) * 100 : 0
+  const snapshot = await fetchYahooChartSnapshot(providerSymbol)
 
   const quote = {
-    symbol: meta.symbol || providerSymbol,
-    regularMarketPrice: price,
-    regularMarketPreviousClose: previousClose,
-    regularMarketChange: change,
-    regularMarketChangePercent: changePercent,
-    currency: meta.currency,
-    marketState: meta.marketState || 'UNKNOWN',
-    fullExchangeName: meta.fullExchangeName,
-    exchangeName: meta.exchangeName,
-    shortName: meta.shortName,
-    longName: meta.longName,
-    quoteType: meta.instrumentType,
-    regularMarketTime: meta.regularMarketTime,
+    symbol: snapshot.symbol,
+    regularMarketPrice: snapshot.price,
+    regularMarketPreviousClose: snapshot.previousClose,
+    regularMarketChange: snapshot.change,
+    regularMarketChangePercent: snapshot.changePercent,
+    currency: snapshot.currency,
+    marketState: snapshot.marketState,
+    fullExchangeName: snapshot.fullExchangeName,
+    exchangeName: snapshot.exchangeName,
+    shortName: snapshot.shortName,
+    longName: snapshot.longName,
+    quoteType: snapshot.quoteType,
+    regularMarketTime: snapshot.regularMarketTime,
   }
 
   const priceData = mapYahooQuoteToInvestmentQuote(requestedSymbol, providerSymbol, quote)
@@ -231,6 +289,94 @@ async function fetchYahooInvestmentQuote(rawSymbol: string): Promise<{ data: Inv
     data: priceData,
     cached: false,
   }
+}
+
+async function fetchYahooFxRate(fromRaw: string, toRaw: string): Promise<{ data: FxRate; cached: boolean }> {
+  const from = normalizeCurrencyCode(fromRaw)
+  const to = normalizeCurrencyCode(toRaw)
+
+  if (!from || !to) {
+    throw new Error('Currency code is required')
+  }
+
+  if (from === to) {
+    return {
+      data: {
+        from,
+        to,
+        rate: 1,
+        providerSymbol: `${from}${to}`,
+        inverted: false,
+        regularMarketTime: null,
+        source: 'identity',
+      },
+      cached: true,
+    }
+  }
+
+  const cacheKey = `fx:${from}:${to}`
+  const cached = getCached(cacheKey)
+
+  if (cached) {
+    return {
+      data: cached,
+      cached: true,
+    }
+  }
+
+  const attempts = [
+    { providerSymbol: `${from}${to}=X`, inverted: false },
+    { providerSymbol: `${to}${from}=X`, inverted: true },
+  ]
+
+  let lastError: Error | null = null
+  let bestRate: FxRate | null = null
+
+  for (const attempt of attempts) {
+    try {
+      const snapshot = await fetchYahooChartSnapshot(attempt.providerSymbol)
+      const rawRate = Number(snapshot.price)
+
+      if (!Number.isFinite(rawRate) || rawRate <= 0) {
+        throw new Error('No FX rate found')
+      }
+
+      const fxRate: FxRate = {
+        from,
+        to,
+        rate: attempt.inverted ? 1 / rawRate : rawRate,
+        providerSymbol: attempt.providerSymbol,
+        inverted: attempt.inverted,
+        regularMarketTime: snapshot.regularMarketTime,
+        source: 'yahoo',
+      }
+
+      if (!attempt.inverted && rawRate < 0.01) {
+        bestRate = fxRate
+        continue
+      }
+
+      setCache(cacheKey, fxRate, 300)
+
+      return {
+        data: fxRate,
+        cached: false,
+      }
+    } catch (error: any) {
+      lastError = error
+    }
+  }
+
+  if (bestRate) {
+    setCache(cacheKey, bestRate, 300)
+
+    return {
+      data: bestRate,
+      cached: false,
+    }
+  }
+
+  throw lastError || new Error(`FX rate not found for ${from}/${to}`)
 }
 
 async function tableExists(DB: D1Database, tableName: string): Promise<boolean> {
@@ -2965,7 +3111,62 @@ app.get('/api/investments/prices', async (c) => {
   })
 })
 
-// 7.6 단일 종목 현재가 조회 (외부 API 프록시) - 인증 불필요 (공개 데이터)
+// 7.6 투자 통화 환율 조회 - 인증 불필요 (공개 데이터)
+app.get('/api/investments/fx-rates', async (c) => {
+  const fromParam = c.req.query('from') || ''
+  const to = normalizeCurrencyCode(c.req.query('to') || 'KRW')
+  const fromCurrencies = Array.from(new Set(
+    fromParam
+      .split(',')
+      .map(normalizeCurrencyCode)
+      .filter(Boolean)
+  )).slice(0, 30)
+
+  if (!to) {
+    return c.json({ success: false, error: '기준 통화를 입력해주세요.' }, 400)
+  }
+
+  if (fromCurrencies.length === 0) {
+    return c.json({ success: false, error: '환산할 통화를 입력해주세요.' }, 400)
+  }
+
+  const results = await Promise.all(fromCurrencies.map(async (from) => {
+    try {
+      const rate = await fetchYahooFxRate(from, to)
+      return { from, rate }
+    } catch (error: any) {
+      console.warn(`[Yahoo Finance] FX API failed for ${from}/${to}:`, error.message)
+      return {
+        from,
+        error: error.message || '환율 정보를 불러올 수 없습니다.',
+      }
+    }
+  }))
+
+  const data: Record<string, FxRate> = {}
+  const errors: Record<string, string> = {}
+  const cached: Record<string, boolean> = {}
+
+  for (const result of results) {
+    if ('rate' in result) {
+      data[result.from] = result.rate.data
+      cached[result.from] = result.rate.cached
+    } else {
+      errors[result.from] = result.error
+    }
+  }
+
+  return c.json({
+    success: true,
+    data,
+    errors,
+    cached,
+    to,
+    source: 'yahoo',
+  })
+})
+
+// 7.7 단일 종목 현재가 조회 (외부 API 프록시) - 인증 불필요 (공개 데이터)
 app.get('/api/investments/price/:symbol', async (c) => {
   const symbol = c.req.param('symbol')
 
@@ -2989,7 +3190,7 @@ app.get('/api/investments/price/:symbol', async (c) => {
   }
 })
 
-// 7.7 투자 거래 내역 조회
+// 7.8 투자 거래 내역 조회
 app.get('/api/investments/:id/transactions', authMiddleware, async (c) => {
   const { DB } = c.env
   const userId = c.get('userId')
