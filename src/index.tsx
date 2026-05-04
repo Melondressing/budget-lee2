@@ -4821,8 +4821,18 @@ app.post('/api/reset-all-data', authMiddleware, async (c) => {
       DB.prepare('DELETE FROM debts WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM debt_payments WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM monthly_summary WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM monthly_reports WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM custom_categories WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM recurring_transaction_instances WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM recurring_transactions WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM accounts WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM transfers WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM shared_account_transactions WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM shared_wallet_transfers WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM shared_wallet_transactions WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM shared_wallet_members WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM shared_transactions WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM shared_budget_members WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM employeeee_pay_runs WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM employeeee_work_entry_deletions WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM employeeee_work_entries WHERE user_id = ?').bind(userId),
@@ -4863,6 +4873,20 @@ app.delete('/api/account/delete', authMiddleware, async (c) => {
       }
     }
 
+    const safeDeleteWhere = async (tableName: string, whereClause: string, ...values: unknown[]) => {
+      try {
+        const result = await DB.prepare(`DELETE FROM ${tableName} WHERE ${whereClause}`).bind(...values).run()
+        console.log(`[Account] Deleted from ${tableName}: ${result.meta.changes} rows`)
+        return result
+      } catch (err: any) {
+        if (err.message && err.message.includes('no such table')) {
+          console.log(`[Account] Table ${tableName} does not exist, skipping...`)
+          return { meta: { changes: 0 } }
+        }
+        throw err
+      }
+    }
+
     // 순차적으로 삭제 (외래 키 제약 조건 고려)
     // 1. 자식 테이블들 먼저 삭제
     await safeDelete('debt_payments')
@@ -4875,6 +4899,75 @@ app.delete('/api/account/delete', authMiddleware, async (c) => {
     await safeDelete('employeeee_work_entry_deletions')
     await safeDelete('employeeee_work_entries')
     await safeDelete('employeeee_pay_rules')
+    await safeDelete('recurring_transaction_instances')
+    await safeDelete('recurring_transactions')
+    await safeDeleteWhere(
+      'shared_account_transactions',
+      `user_id = ? OR account_id IN (
+        SELECT id FROM shared_wallet_accounts
+        WHERE shared_wallet_id IN (
+          SELECT id FROM shared_wallets WHERE owner_user_id = ?
+        )
+      )`,
+      userId,
+      userId
+    )
+    await safeDeleteWhere(
+      'shared_wallet_transfers',
+      `user_id = ? OR shared_wallet_id IN (
+        SELECT id FROM shared_wallets WHERE owner_user_id = ?
+      )`,
+      userId,
+      userId
+    )
+    await safeDeleteWhere(
+      'shared_wallet_transactions',
+      `user_id = ? OR shared_wallet_id IN (
+        SELECT id FROM shared_wallets WHERE owner_user_id = ?
+      )`,
+      userId,
+      userId
+    )
+    await safeDeleteWhere(
+      'shared_wallet_budgets',
+      `shared_wallet_id IN (
+        SELECT id FROM shared_wallets WHERE owner_user_id = ?
+      )`,
+      userId
+    )
+    await safeDeleteWhere(
+      'shared_wallet_accounts',
+      `shared_wallet_id IN (
+        SELECT id FROM shared_wallets WHERE owner_user_id = ?
+      )`,
+      userId
+    )
+    await safeDeleteWhere(
+      'shared_wallet_members',
+      `user_id = ? OR shared_wallet_id IN (
+        SELECT id FROM shared_wallets WHERE owner_user_id = ?
+      )`,
+      userId,
+      userId
+    )
+    await safeDeleteWhere('shared_wallets', 'owner_user_id = ?', userId)
+    await safeDeleteWhere(
+      'shared_transactions',
+      `user_id = ? OR shared_budget_id IN (
+        SELECT id FROM shared_budgets WHERE owner_user_id = ?
+      )`,
+      userId,
+      userId
+    )
+    await safeDeleteWhere(
+      'shared_budget_members',
+      `user_id = ? OR shared_budget_id IN (
+        SELECT id FROM shared_budgets WHERE owner_user_id = ?
+      )`,
+      userId,
+      userId
+    )
+    await safeDeleteWhere('shared_budgets', 'owner_user_id = ?', userId)
     await safeDelete('transfers')
     await safeDelete('receipts')
     await safeDelete('transactions')
@@ -4884,6 +4977,8 @@ app.delete('/api/account/delete', authMiddleware, async (c) => {
     await safeDelete('category_budgets')
     await safeDelete('savings_accounts')
     await safeDelete('monthly_summary')
+    await safeDelete('monthly_reports')
+    await safeDelete('custom_categories')
     await safeDelete('settings')
 
     // 3. 세션 삭제
