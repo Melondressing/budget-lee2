@@ -4822,7 +4822,11 @@ app.post('/api/reset-all-data', authMiddleware, async (c) => {
       DB.prepare('DELETE FROM debt_payments WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM monthly_summary WHERE user_id = ?').bind(userId),
       DB.prepare('DELETE FROM accounts WHERE user_id = ?').bind(userId),
-      DB.prepare('DELETE FROM transfers WHERE user_id = ?').bind(userId)
+      DB.prepare('DELETE FROM transfers WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM employeeee_pay_runs WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM employeeee_work_entry_deletions WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM employeeee_work_entries WHERE user_id = ?').bind(userId),
+      DB.prepare('DELETE FROM employeeee_pay_rules WHERE user_id = ?').bind(userId)
     ])
 
     return c.json({
@@ -4867,6 +4871,10 @@ app.delete('/api/account/delete', authMiddleware, async (c) => {
     await safeDelete('investments')
     await safeDelete('fixed_expense_payments')
     await safeDelete('fixed_expenses')
+    await safeDelete('employeeee_pay_runs')
+    await safeDelete('employeeee_work_entry_deletions')
+    await safeDelete('employeeee_work_entries')
+    await safeDelete('employeeee_pay_rules')
     await safeDelete('transfers')
     await safeDelete('receipts')
     await safeDelete('transactions')
