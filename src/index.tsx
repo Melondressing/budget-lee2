@@ -146,6 +146,14 @@ function normalizeCurrencyCode(rawCurrency: string): string {
   return String(rawCurrency || '').trim().toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3)
 }
 
+function normalizeInviteCode(rawInviteCode: unknown): string {
+  return String(rawInviteCode || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]/g, '')
+    .slice(0, 32)
+}
+
 async function fetchYahooChartSnapshot(providerSymbol: string): Promise<YahooChartSnapshot> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(providerSymbol)}?range=1d&interval=1d`
   const response = await fetch(url, {
@@ -1188,24 +1196,16 @@ app.get('/api/auth/google/callback', async (c) => {
     `).bind(googleUser.email).first() as any
 
     if (!user) {
-      // Create new user with Google OAuth
-      const result = await DB.prepare(`
-        INSERT INTO users (username, email, name, password_hash)
-        VALUES (?, ?, ?, ?)
-      `).bind(
-        googleUser.email.split('@')[0], // username from email
-        googleUser.email,
-        googleUser.name || 'Google User',
-        'GOOGLE_OAUTH' // No password for OAuth users
-      ).run()
-
-      const userId = result.meta.last_row_id as number
-      user = {
-        id: userId,
-        username: googleUser.email.split('@')[0],
-        email: googleUser.email,
-        name: googleUser.name || 'Google User'
-      }
+      return c.html(`
+        <html>
+          <body>
+            <h1>Invite Required</h1>
+            <p>New sign-ups are currently invite-only.</p>
+            <p>Please create your account with an invite code first, then you can connect Google later.</p>
+            <a href="/">← Back to App</a>
+          </body>
+        </html>
+      `, 403)
     } else {
       // User exists - update email if not set (for legacy accounts)
       if (!user.email || user.email === '') {
@@ -1485,10 +1485,14 @@ app.post('/api/auth/migrate-data', authMiddleware, async (c) => {
 // 회원가입
 app.post('/api/auth/register', async (c) => {
   const { DB } = c.env
-  const { username, password, name } = await c.req.json()
+  const body = await c.req.json()
+  const username = String(body?.username || '').trim()
+  const password = String(body?.password || '').trim()
+  const name = String(body?.name || '').trim()
+  const inviteCode = normalizeInviteCode(body?.inviteCode ?? body?.invite_code)
 
   // 입력 검증
-  if (!username || !password || !name) {
+  if (!username || !password || !name || !inviteCode) {
     return c.json({ success: false, error: '모든 필드를 입력해주세요.' }, 400)
   }
 
@@ -1499,6 +1503,20 @@ app.post('/api/auth/register', async (c) => {
   // 숫자만 허용
   if (!/^\d{4}$/.test(password)) {
     return c.json({ success: false, error: '비밀번호는 숫자 4자리여야 합니다.' }, 400)
+  }
+
+  const invite = await DB.prepare(`
+    SELECT code, is_active, used_by_user_id
+    FROM auth_invite_codes
+    WHERE code = ?
+  `).bind(inviteCode).first() as any
+
+  if (!invite || Number(invite.is_active) !== 1) {
+    return c.json({ success: false, error: '유효하지 않은 초대코드입니다.' }, 400)
+  }
+
+  if (invite.used_by_user_id) {
+    return c.json({ success: false, error: '이미 사용된 초대코드입니다.' }, 400)
   }
 
   // 아이디 중복 확인
@@ -1520,6 +1538,17 @@ app.post('/api/auth/register', async (c) => {
   `).bind(username, passwordHash, name).run()
 
   const userId = result.meta.last_row_id as number
+  const inviteClaim = await DB.prepare(`
+    UPDATE auth_invite_codes
+    SET used_by_user_id = ?, used_at = CURRENT_TIMESTAMP
+    WHERE code = ? AND is_active = 1 AND used_by_user_id IS NULL
+  `).bind(userId, inviteCode).run()
+
+  if ((inviteClaim.meta.changes || 0) < 1) {
+    await DB.prepare(`DELETE FROM users WHERE id = ?`).bind(userId).run()
+    return c.json({ success: false, error: '초대코드를 사용할 수 없습니다. 다시 확인해주세요.' }, 400)
+  }
+
   const secret = c.env.JWT_SECRET || 'default-secret-key-change-in-production'
 
   // JWT 토큰 발급

@@ -1236,8 +1236,9 @@ async function handleRegister(event) {
   const password = formData.get('password');
   const confirmPassword = formData.get('confirmPassword');
   const name = formData.get('name');
+  const inviteCode = String(formData.get('inviteCode') || '').trim().toUpperCase();
 
-  if (!username || !password || !confirmPassword || !name) {
+  if (!username || !password || !confirmPassword || !name || !inviteCode) {
     alert('모든 필드를 입력해주세요.');
     return;
   }
@@ -1258,7 +1259,7 @@ async function handleRegister(event) {
   }
 
   try {
-    const res = await axios.post('/api/auth/register', { username, password, name });
+    const res = await axios.post('/api/auth/register', { username, password, name, inviteCode });
     console.log('[Register] Response:', res.data);
 
     const token = res.data.token;
@@ -1462,6 +1463,23 @@ function renderLoginScreen() {
             </div>
             <div>
               <label class="block text-sm font-medium text-gray-700 mb-1">
+                <i class="fas fa-key mr-2"></i>Invite Code
+              </label>
+              <input
+                type="text"
+                name="inviteCode"
+                required
+                maxlength="32"
+                class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent uppercase tracking-wide"
+                placeholder="LAUNCH-001"
+                autocomplete="one-time-code"
+              >
+            </div>
+            <p class="text-xs text-gray-500 leading-5">
+              Early access is invite-only. Each code can be used once.
+            </p>
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">
                 <i class="fas fa-lock mr-2"></i>Confirm Password
               </label>
               <input
@@ -1486,7 +1504,7 @@ function renderLoginScreen() {
         </div>
 
         <div class="mt-6 text-center text-sm text-gray-600">
-          <p>First time here? Sign up to get started!</p>
+          <p>First time here? Sign up with your invite code to get started.</p>
         </div>
       </div>
     </div>
