@@ -973,17 +973,6 @@ function validateDate(dateString, fieldName = '날짜') {
   return { valid: true, value: dateString };
 }
 
-function validateDateRange(startDate, endDate) {
-  const start = new Date(startDate);
-  const end = new Date(endDate);
-
-  if (start > end) {
-    return { valid: false, error: '시작 날짜는 종료 날짜보다 이전이어야 합니다.' };
-  }
-
-  return { valid: true };
-}
-
 function validateString(value, minLength = 1, maxLength = 255, fieldName = '텍스트') {
   if (!value || typeof value !== 'string') {
     return { valid: false, error: `${fieldName}을(를) 입력해주세요.` };
@@ -1056,24 +1045,6 @@ function validateInvestmentPrice(price) {
 }
 
 // 인증 관련 함수
-
-function setAuthToken(accessToken, refreshToken) {
-  console.log('[Auth] Setting tokens - Access:', accessToken?.substring(0, 20) + '...', 'Refresh:', refreshToken?.substring(0, 20) + '...');
-  state.authToken = accessToken;
-  syncStoredAuthToken(accessToken);
-  localStorage.setItem('refreshToken', refreshToken);
-  axios.defaults.headers.common['Authorization'] = `Bearer ${accessToken}`;
-  console.log('[Auth] Tokens set successfully');
-}
-
-function clearAuthToken() {
-  state.authToken = null;
-  state.isAuthenticated = false;
-  state.currentUser = null;
-  clearStoredAuthToken();
-  localStorage.removeItem('refreshToken');
-  delete axios.defaults.headers.common['Authorization'];
-}
 
 async function checkAuth() {
   const token = getStoredAuthToken();
