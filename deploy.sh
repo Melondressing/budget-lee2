@@ -47,7 +47,7 @@ echo ""
 
 # 5. Pages 배포
 echo "🚀 Cloudflare Pages 배포 중..."
-npx wrangler pages deploy dist --project-name budgetlee
+npx wrangler pages deploy dist --project-name budget-lee
 if [ $? -ne 0 ]; then
   echo "❌ 배포 실패"
   exit 1
@@ -57,10 +57,10 @@ echo ""
 echo "✅ 배포 완료!"
 echo ""
 echo "🌐 사이트 URL:"
-echo "   https://budgetlee.pages.dev"
-echo "   https://main.budgetlee.pages.dev"
+echo "   https://budget-lee.pages.dev"
+echo "   https://main.budget-lee.pages.dev"
 echo ""
 echo "📊 다음 단계:"
-echo "   1. JWT Secret 설정: npx wrangler pages secret put JWT_SECRET --project-name budgetlee"
+echo "   1. JWT Secret 설정: npx wrangler pages secret put JWT_SECRET --project-name budget-lee"
 echo "   2. 브라우저에서 사이트 접속 및 테스트"
 echo ""

@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { serveStatic } from 'hono/cloudflare-workers'
 import { sign, verify } from 'hono/jwt'
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 
 type Bindings = {
   DB: D1Database;
@@ -1008,13 +1009,59 @@ app.use('/static/*', serveStatic({ root: './' }))
 
 // ========== 인증 유틸리티 함수 ==========
 
-// SHA-256 비밀번호 해싱
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string))
+}
+
+// JWT 시크릿 (JWT_SECRET 미설정 시 기존 기본값 사용 - 운영에서는 반드시 설정)
+function getJwtSecret(env: Bindings): string {
+  if (!env.JWT_SECRET) {
+    console.warn('[Auth] JWT_SECRET is not set. Using the insecure default secret.')
+  }
+  return env.JWT_SECRET || 'default-secret-key-change-in-production'
+}
+
+const PBKDF2_ITERATIONS = 100000
+const MAX_LOGIN_FAILURES = 5
+const LOGIN_LOCK_MINUTES = 15
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16)
+  return out
+}
+
+async function derivePbkdf2(password: string, salt: Uint8Array, iterations: number): Promise<string> {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits'])
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, 256)
+  return bytesToHex(new Uint8Array(bits))
+}
+
+// 새 비밀번호 해시: pbkdf2$반복횟수$솔트$해시
 async function hashPassword(password: string): Promise<string> {
-  const encoder = new TextEncoder()
-  const data = encoder.encode(password)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-  const hashArray = Array.from(new Uint8Array(hashBuffer))
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+  const salt = crypto.getRandomValues(new Uint8Array(16))
+  const hash = await derivePbkdf2(password, salt, PBKDF2_ITERATIONS)
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${bytesToHex(salt)}$${hash}`
+}
+
+async function legacySha256(password: string): Promise<string> {
+  const buffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(password))
+  return bytesToHex(new Uint8Array(buffer))
+}
+
+// 비밀번호 검증 (기존 SHA-256 해시도 허용, needsUpgrade=true면 로그인 후 재해싱)
+async function verifyPassword(password: string, stored: string): Promise<{ ok: boolean; needsUpgrade: boolean }> {
+  if (!stored) return { ok: false, needsUpgrade: false }
+  if (stored.startsWith('pbkdf2$')) {
+    const [, iterations, salt, hash] = stored.split('$')
+    const actual = await derivePbkdf2(password, hexToBytes(salt), Number(iterations))
+    return { ok: actual === hash, needsUpgrade: false }
+  }
+  return { ok: (await legacySha256(password)) === stored, needsUpgrade: true }
 }
 
 // JWT 토큰 생성
@@ -1028,46 +1075,57 @@ async function createToken(userId: number, username: string, secret: string): Pr
   return await sign(payload, secret)
 }
 
-// 인증 미들웨어 (JWT 토큰 + 세션 ID 혼합 지원)
+// 로그인 실패 횟수 제한 (login_attempts 테이블이 아직 없으면 제한 없이 통과)
+async function isLoginLocked(DB: D1Database, username: string): Promise<boolean> {
+  try {
+    const row = await DB.prepare(`SELECT fail_count, locked_until FROM login_attempts WHERE username = ?`)
+      .bind(username).first() as any
+    return !!row && Number(row.fail_count) >= MAX_LOGIN_FAILURES && Number(row.locked_until) > Date.now()
+  } catch {
+    return false
+  }
+}
+
+async function recordLoginFailure(DB: D1Database, username: string): Promise<void> {
+  try {
+    const row = await DB.prepare(`SELECT fail_count, locked_until FROM login_attempts WHERE username = ?`)
+      .bind(username).first() as any
+    const expired = row && Number(row.locked_until) > 0 && Number(row.locked_until) <= Date.now()
+    const failCount = (row && !expired ? Number(row.fail_count) : 0) + 1
+    const lockedUntil = failCount >= MAX_LOGIN_FAILURES ? Date.now() + LOGIN_LOCK_MINUTES * 60 * 1000 : 0
+    await DB.prepare(`
+      INSERT INTO login_attempts (username, fail_count, locked_until) VALUES (?, ?, ?)
+      ON CONFLICT(username) DO UPDATE SET fail_count = excluded.fail_count, locked_until = excluded.locked_until
+    `).bind(username, failCount, lockedUntil).run()
+  } catch (error) {
+    console.warn('[Auth] Could not record login failure:', error)
+  }
+}
+
+async function clearLoginFailures(DB: D1Database, username: string): Promise<void> {
+  try {
+    await DB.prepare(`DELETE FROM login_attempts WHERE username = ?`).bind(username).run()
+  } catch {}
+}
+
+// 인증 미들웨어: 유효한 JWT만 허용
 const authMiddleware = async (c: any, next: any) => {
   const authHeader = c.req.header('Authorization')
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    // 헤더가 없으면 기본 사용자 (게스트 모드)
-    c.set('userId', 1)
-    c.set('username', 'guest')
-    await next()
-    return
+    return c.json({ success: false, error: '로그인이 필요합니다.' }, 401)
   }
 
-  const token = authHeader.substring(7)
-  const secret = c.env.JWT_SECRET || 'default-secret-key-change-in-production'
-
-  // 1. JWT 토큰인지 확인 (JWT는 'eyJ'로 시작)
-  if (token.startsWith('eyJ')) {
-    try {
-      const payload = await verify(token, secret)
-      c.set('userId', parseInt(payload.sub as string))
-      c.set('username', payload.username as string)
-      await next()
-      return
-    } catch (error) {
-      // JWT 검증 실패 → 세션 ID로 fallback
-      console.log('[Auth] JWT verification failed, trying session ID')
-    }
+  try {
+    const payload = await verify(authHeader.substring(7), getJwtSecret(c.env))
+    const userId = parseInt(payload.sub as string)
+    if (!Number.isInteger(userId) || userId <= 0) throw new Error('invalid subject')
+    c.set('userId', userId)
+    c.set('username', payload.username as string)
+  } catch {
+    return c.json({ success: false, error: '로그인이 만료되었거나 유효하지 않습니다.' }, 401)
   }
 
-  // 2. 세션 ID로 처리 (JWT가 아니거나 검증 실패한 경우)
-  // 세션 ID를 해싱해서 user_id로 사용 (1~999999 범위)
-  let hash = 0
-  for (let i = 0; i < token.length; i++) {
-    hash = ((hash << 5) - hash) + token.charCodeAt(i)
-    hash = hash & hash // Convert to 32bit integer
-  }
-  const userId = Math.abs(hash % 999999) + 1
-
-  c.set('userId', userId)
-  c.set('username', `session_${userId}`)
   await next()
 }
 
@@ -1107,6 +1165,10 @@ app.get('/api/auth/google', async (c) => {
     `)
   }
 
+  // CSRF 방지용 state (쿠키에 저장했다가 콜백에서 비교)
+  const oauthState = bytesToHex(crypto.getRandomValues(new Uint8Array(16)))
+  setCookie(c, 'oauth_state', oauthState, { httpOnly: true, secure: true, sameSite: 'Lax', path: '/api/auth/google', maxAge: 600 })
+
   // Google OAuth URL 생성
   const params = new URLSearchParams({
     client_id: clientId,
@@ -1114,7 +1176,8 @@ app.get('/api/auth/google', async (c) => {
     response_type: 'code',
     scope: 'email profile openid',
     access_type: 'offline',
-    prompt: 'consent'
+    prompt: 'consent',
+    state: oauthState
   })
 
   const googleAuthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`
@@ -1133,7 +1196,7 @@ app.get('/api/auth/google/callback', async (c) => {
       <html>
         <body>
           <h1>Login Failed</h1>
-          <p>Error: ${error}</p>
+          <p>Error: ${escapeHtml(error)}</p>
           <a href="/">← Back to App</a>
         </body>
       </html>
@@ -1142,6 +1205,12 @@ app.get('/api/auth/google/callback', async (c) => {
 
   if (!code) {
     return c.json({ success: false, error: 'No authorization code received' }, 400)
+  }
+
+  const expectedState = getCookie(c, 'oauth_state')
+  deleteCookie(c, 'oauth_state', { path: '/api/auth/google' })
+  if (!expectedState || expectedState !== c.req.query('state')) {
+    return c.json({ success: false, error: 'Invalid OAuth state' }, 400)
   }
 
   const clientId = c.env.GOOGLE_CLIENT_ID
@@ -1218,7 +1287,7 @@ app.get('/api/auth/google/callback', async (c) => {
     }
 
     // 4. Create JWT token
-    const secret = c.env.JWT_SECRET || 'default-secret-key'
+    const secret = getJwtSecret(c.env)
     const token = await createToken(user.id, user.username, secret)
 
     const safeToken = JSON.stringify(token)
@@ -1264,21 +1333,13 @@ app.get('/api/auth/google/callback', async (c) => {
 app.post('/api/auth/logout', async (c) => {
   return c.json({
     success: true,
-    message: '로그아웃되었습니다. (클라이언트에서 토큰을 삭제하세요)'
+    message: '로그아웃되었습니다.'
   })
 })
 
 // 현재 사용자 정보 조회
 app.get('/api/auth/me', authMiddleware, async (c) => {
   const userId = c.get('userId')
-  const username = c.get('username')
-
-  if (!userId || userId === 1) {
-    return c.json({
-      success: true,
-      user: { id: 1, username: 'guest', name: 'Guest User', isGuest: true }
-    })
-  }
 
   const { DB } = c.env
   const user = await DB.prepare(`
@@ -1307,10 +1368,6 @@ app.post('/api/auth/link-google', authMiddleware, async (c) => {
   const { DB } = c.env
   const currentUserId = c.get('userId')
   const { googleEmail } = await c.req.json()
-
-  if (!currentUserId || currentUserId === 1) {
-    return c.json({ success: false, error: '로그인이 필요합니다.' }, 401)
-  }
 
   if (!googleEmail || !googleEmail.includes('@')) {
     return c.json({ success: false, error: '유효한 이메일이 필요합니다.' }, 400)
@@ -1373,108 +1430,6 @@ app.post('/api/auth/link-google', authMiddleware, async (c) => {
     return c.json({
       success: false,
       error: '계정 연동 중 오류가 발생했습니다.',
-      details: error.message
-    }, 500)
-  }
-})
-
-// 데이터 마이그레이션 (기존 계정 → 구글 계정)
-app.post('/api/auth/migrate-data', authMiddleware, async (c) => {
-  const { DB } = c.env
-  const { fromUserId, toUserId, password } = await c.req.json()
-
-  if (!fromUserId || !toUserId || !password) {
-    return c.json({ success: false, error: '필수 정보가 누락되었습니다.' }, 400)
-  }
-
-  try {
-    // 1. 기존 계정 비밀번호 확인
-    const fromUser = await DB.prepare(`
-      SELECT id, username, password_hash FROM users WHERE id = ?
-    `).bind(fromUserId).first() as any
-
-    if (!fromUser) {
-      return c.json({ success: false, error: '기존 계정을 찾을 수 없습니다.' }, 404)
-    }
-
-    // 비밀번호 검증
-    const passwordHash = await hashPassword(password)
-    if (fromUser.password_hash !== passwordHash) {
-      return c.json({ success: false, error: '비밀번호가 일치하지 않습니다.' }, 401)
-    }
-
-    // 2. 대상 계정 확인
-    const toUser = await DB.prepare(`
-      SELECT id, email FROM users WHERE id = ?
-    `).bind(toUserId).first() as any
-
-    if (!toUser) {
-      return c.json({ success: false, error: '대상 계정을 찾을 수 없습니다.' }, 404)
-    }
-
-    // 3. 모든 거래 내역 마이그레이션
-    await DB.prepare(`
-      UPDATE transactions SET user_id = ? WHERE user_id = ?
-    `).bind(toUserId, fromUserId).run()
-
-    // 4. 저축 계좌 마이그레이션
-    await DB.prepare(`
-      UPDATE savings_accounts SET user_id = ? WHERE user_id = ?
-    `).bind(toUserId, fromUserId).run()
-
-    // 5. 고정 지출 마이그레이션
-    await DB.prepare(`
-      UPDATE fixed_expenses SET user_id = ? WHERE user_id = ?
-    `).bind(toUserId, fromUserId).run()
-
-    // 6. 카테고리 예산 마이그레이션
-    await DB.prepare(`
-      UPDATE category_budgets SET user_id = ? WHERE user_id = ?
-    `).bind(toUserId, fromUserId).run()
-
-    // 7. 투자 내역 마이그레이션
-    await DB.prepare(`
-      UPDATE investments SET user_id = ? WHERE user_id = ?
-    `).bind(toUserId, fromUserId).run()
-
-    // 8. 설정 마이그레이션
-    await DB.prepare(`
-      UPDATE settings SET user_id = ? WHERE user_id = ?
-    `).bind(toUserId, fromUserId).run()
-
-    // 9. 월별 요약 마이그레이션
-    await DB.prepare(`
-      UPDATE monthly_summary SET user_id = ? WHERE user_id = ?
-    `).bind(toUserId, fromUserId).run()
-
-    // 10. 기존 계정 삭제 (선택사항 - 주석 처리하면 보존)
-    // await DB.prepare(`DELETE FROM users WHERE id = ?`).bind(fromUserId).run()
-
-    // 11. 기존 계정 비활성화 (삭제 대신)
-    await DB.prepare(`
-      UPDATE users SET password_hash = 'MIGRATED_TO_GOOGLE', name = ? WHERE id = ?
-    `).bind(`[MIGRATED] ${fromUser.username}`, fromUserId).run()
-
-    console.log(`[Migration] Data migrated: User ${fromUserId} -> ${toUserId}`)
-
-    return c.json({
-      success: true,
-      message: '모든 데이터가 성공적으로 마이그레이션되었습니다.',
-      migratedItems: {
-        transactions: true,
-        savingsAccounts: true,
-        fixedExpenses: true,
-        budgets: true,
-        investments: true,
-        settings: true
-      }
-    })
-
-  } catch (error: any) {
-    console.error('[Migration] Error:', error)
-    return c.json({
-      success: false,
-      error: '데이터 마이그레이션 중 오류가 발생했습니다.',
       details: error.message
     }, 500)
   }
@@ -1549,7 +1504,7 @@ app.post('/api/auth/register', async (c) => {
     return c.json({ success: false, error: '초대코드를 사용할 수 없습니다. 다시 확인해주세요.' }, 400)
   }
 
-  const secret = c.env.JWT_SECRET || 'default-secret-key-change-in-production'
+  const secret = getJwtSecret(c.env)
 
   // JWT 토큰 발급
   const token = await createToken(userId, username, secret)
@@ -1575,6 +1530,10 @@ app.post('/api/auth/login', async (c) => {
     return c.json({ success: false, error: '아이디와 비밀번호를 입력해주세요.' }, 400)
   }
 
+  if (await isLoginLocked(DB, username)) {
+    return c.json({ success: false, error: `로그인 시도가 너무 많습니다. ${LOGIN_LOCK_MINUTES}분 후 다시 시도해주세요.` }, 429)
+  }
+
   // 사용자 조회
   const user = await DB.prepare(`
     SELECT id, username, password_hash, name FROM users WHERE username = ?
@@ -1585,9 +1544,18 @@ app.post('/api/auth/login', async (c) => {
   }
 
   // 비밀번호 검증
-  const passwordHash = await hashPassword(password)
-  if (passwordHash !== user.password_hash) {
+  const { ok, needsUpgrade } = await verifyPassword(String(password), user.password_hash)
+  if (!ok) {
+    await recordLoginFailure(DB, username)
     return c.json({ success: false, error: '아이디 또는 비밀번호가 올바르지 않습니다.' }, 401)
+  }
+
+  await clearLoginFailures(DB, username)
+
+  // 기존 SHA-256 해시는 로그인 성공 시 솔트가 있는 PBKDF2로 교체
+  if (needsUpgrade) {
+    await DB.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`)
+      .bind(await hashPassword(String(password)), user.id).run()
   }
 
   // 마지막 로그인 시간 업데이트
@@ -1596,7 +1564,7 @@ app.post('/api/auth/login', async (c) => {
   `).bind(user.id).run()
 
   // JWT 토큰 발급
-  const secret = c.env.JWT_SECRET || 'default-secret-key-change-in-production'
+  const secret = getJwtSecret(c.env)
   const token = await createToken(user.id, user.username, secret)
 
   return c.json({
@@ -1606,69 +1574,6 @@ app.post('/api/auth/login', async (c) => {
       id: user.id,
       username: user.username,
       name: user.name
-    }
-  })
-})
-
-// Token Refresh (Access Token 갱신)
-app.post('/api/auth/refresh', async (c) => {
-  const { DB } = c.env
-  const { refreshToken } = await c.req.json()
-
-  if (!refreshToken) {
-    return c.json({ success: false, error: 'Refresh token이 필요합니다.' }, 400)
-  }
-
-  // Refresh Token 검증
-  const session = await verifyRefreshToken(DB, refreshToken)
-
-  if (!session) {
-    return c.json({ success: false, error: '유효하지 않거나 만료된 refresh token입니다.' }, 401)
-  }
-
-  // 새로운 Access Token 생성
-  const secret = c.env.JWT_SECRET || 'default-secret-key-change-in-production'
-  const accessToken = await createAccessToken(session.user_id, session.username, secret)
-
-  return c.json({
-    success: true,
-    access: accessToken    // 통일: access
-  })
-})
-
-// 로그아웃 (Refresh Token 삭제)
-app.post('/api/auth/logout', async (c) => {
-  const { DB } = c.env
-  const { refreshToken } = await c.req.json()
-
-  if (refreshToken) {
-    await deleteRefreshToken(DB, refreshToken)
-  }
-
-  return c.json({ success: true, message: '로그아웃되었습니다.' })
-})
-
-// 현재 사용자 정보 조회
-app.get('/api/auth/me', authMiddleware, async (c) => {
-  const { DB } = c.env
-  const userId = c.get('userId')
-
-  const user = await DB.prepare(`
-    SELECT id, username, name, created_at, last_login FROM users WHERE id = ?
-  `).bind(userId).first() as any
-
-  if (!user) {
-    return c.json({ success: false, error: '사용자를 찾을 수 없습니다.' }, 404)
-  }
-
-  return c.json({
-    success: true,
-    user: {
-      id: user.id,
-      username: user.username,
-      name: user.name,
-      createdAt: user.created_at,
-      lastLogin: user.last_login
     }
   })
 })
@@ -3092,7 +2997,7 @@ app.delete('/api/investments/:id', authMiddleware, async (c) => {
 })
 
 // 7.5 여러 종목 현재가 조회 (외부 API 프록시) - 인증 불필요 (공개 데이터)
-app.get('/api/investments/prices', async (c) => {
+app.get('/api/investments/prices', authMiddleware, async (c) => {
   const symbolsParam = c.req.query('symbols') || ''
   const symbols = Array.from(new Set(
     symbolsParam
@@ -3141,7 +3046,7 @@ app.get('/api/investments/prices', async (c) => {
 })
 
 // 7.6 투자 통화 환율 조회 - 인증 불필요 (공개 데이터)
-app.get('/api/investments/fx-rates', async (c) => {
+app.get('/api/investments/fx-rates', authMiddleware, async (c) => {
   const fromParam = c.req.query('from') || ''
   const to = normalizeCurrencyCode(c.req.query('to') || 'KRW')
   const fromCurrencies = Array.from(new Set(
@@ -3196,7 +3101,7 @@ app.get('/api/investments/fx-rates', async (c) => {
 })
 
 // 7.7 단일 종목 현재가 조회 (외부 API 프록시) - 인증 불필요 (공개 데이터)
-app.get('/api/investments/price/:symbol', async (c) => {
+app.get('/api/investments/price/:symbol', authMiddleware, async (c) => {
   const symbol = c.req.param('symbol')
 
   try {

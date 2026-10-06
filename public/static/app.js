@@ -1,31 +1,10 @@
-// ===== 앱 초기 부팅 시 세션 ID 생성 및 axios에 장착 =====
-(function initializeSession() {
-  const getStoredAuthToken = () => localStorage.getItem('auth_token') || localStorage.getItem('authToken');
-
-  // 1. Google OAuth 토큰 우선 확인
-  const authToken = getStoredAuthToken();
+// 저장된 로그인 토큰을 axios 헤더에 장착 (토큰이 없으면 로그인 화면으로 이동)
+(function initializeAuthHeader() {
+  const authToken = localStorage.getItem('auth_token') || localStorage.getItem('authToken');
   if (authToken) {
-    // 레거시 키/신규 키 모두 동기화
-    localStorage.setItem('auth_token', authToken);
-    localStorage.setItem('authToken', authToken);
     axios.defaults.headers.common['Authorization'] = `Bearer ${authToken}`;
-    console.log('[Session] Google OAuth token loaded');
-    return;
   }
-
-  // 2. 세션 ID가 없으면 생성 (브라우저별 고유 ID)
-  let sessionId = localStorage.getItem('sessionId');
-  if (!sessionId) {
-    // UUID 형식의 고유 ID 생성
-    sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 15);
-    localStorage.setItem('sessionId', sessionId);
-    console.log('[Session] New session created:', sessionId);
-  } else {
-    console.log('[Session] Existing session loaded:', sessionId);
-  }
-
-  // 3. axios 기본 헤더에 세션 ID 설정
-  axios.defaults.headers.common['Authorization'] = `Bearer ${sessionId}`;
+  localStorage.removeItem('sessionId');
 })();
 
 // 전역 상태 객체
@@ -973,17 +952,6 @@ function validateDate(dateString, fieldName = '날짜') {
   return { valid: true, value: dateString };
 }
 
-function validateDateRange(startDate, endDate) {
-  const start = new Date(startDate);
-  const end = new Date(endDate);
-
-  if (start > end) {
-    return { valid: false, error: '시작 날짜는 종료 날짜보다 이전이어야 합니다.' };
-  }
-
-  return { valid: true };
-}
-
 function validateString(value, minLength = 1, maxLength = 255, fieldName = '텍스트') {
   if (!value || typeof value !== 'string') {
     return { valid: false, error: `${fieldName}을(를) 입력해주세요.` };
@@ -1056,24 +1024,6 @@ function validateInvestmentPrice(price) {
 }
 
 // 인증 관련 함수
-
-function setAuthToken(accessToken, refreshToken) {
-  console.log('[Auth] Setting tokens - Access:', accessToken?.substring(0, 20) + '...', 'Refresh:', refreshToken?.substring(0, 20) + '...');
-  state.authToken = accessToken;
-  syncStoredAuthToken(accessToken);
-  localStorage.setItem('refreshToken', refreshToken);
-  axios.defaults.headers.common['Authorization'] = `Bearer ${accessToken}`;
-  console.log('[Auth] Tokens set successfully');
-}
-
-function clearAuthToken() {
-  state.authToken = null;
-  state.isAuthenticated = false;
-  state.currentUser = null;
-  clearStoredAuthToken();
-  localStorage.removeItem('refreshToken');
-  delete axios.defaults.headers.common['Authorization'];
-}
 
 async function checkAuth() {
   const token = getStoredAuthToken();
@@ -10174,12 +10124,7 @@ function setupLogoutHandler() {
       localStorage.removeItem('user_name');
 
       // axios 헤더에서 토큰 제거
-      const sessionId = localStorage.getItem('sessionId');
-      if (sessionId) {
-        axios.defaults.headers.common['Authorization'] = `Bearer ${sessionId}`;
-      } else {
-        delete axios.defaults.headers.common['Authorization'];
-      }
+      delete axios.defaults.headers.common['Authorization'];
 
       console.log('[Auth] User logged out');
 
@@ -10207,7 +10152,7 @@ async function checkGoogleLinkStatus() {
         alert(getLanguage() === 'ko'
           ? '먼저 로그인해주세요.'
           : 'Please login first.');
-        showAuthModal();
+        renderLoginScreen();
         return;
       }
 
@@ -10250,49 +10195,6 @@ function showGoogleLinkConfirm() {
 
     // 구글 OAuth 페이지로 이동
     window.location.href = '/api/auth/google';
-  }
-}
-
-// 데이터 마이그레이션 모달
-async function showMigrationModal(existingUserId) {
-  const password = prompt(getLanguage() === 'ko'
-    ? '기존 계정의 비밀번호를 입력하세요 (4자리):'
-    : 'Enter your old account password (4 digits):');
-
-  if (!password || password.length !== 4) {
-    alert(getLanguage() === 'ko'
-      ? '올바른 비밀번호를 입력하세요.'
-      : 'Please enter a valid password.');
-    return;
-  }
-
-  if (confirm(getLanguage() === 'ko'
-    ? '정말로 모든 데이터를 구글 계정으로 이동하시겠습니까? 기존 계정은 비활성화됩니다.'
-    : 'Really migrate all data to Google account? Old account will be disabled.')) {
-
-    try {
-      const currentUserId = state.currentUser?.id;
-      const response = await axios.post('/api/auth/migrate-data', {
-        fromUserId: currentUserId,
-        toUserId: existingUserId,
-        password: password
-      });
-
-      if (response.data.success) {
-        alert(getLanguage() === 'ko'
-          ? '✅ 데이터 마이그레이션이 완료되었습니다! 다시 로그인해주세요.'
-          : '✅ Data migration completed! Please login again.');
-
-        // 로그아웃 후 새로고침
-        localStorage.clear();
-        window.location.reload();
-      } else {
-        alert(response.data.error || 'Migration failed');
-      }
-    } catch (error) {
-      console.error('[Migration] Error:', error);
-      alert(error.response?.data?.error || 'Migration failed');
-    }
   }
 }
 
